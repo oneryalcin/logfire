@@ -177,6 +177,7 @@ class BaseScrubber(ABC):
         gen_ai_semconv.CLAUDE_RESULT_STRUCTURED_OUTPUT,
         gen_ai_semconv.CLAUDE_RESULT_SUBTYPE,
         gen_ai_semconv.CLAUDE_MODEL_USAGE,
+        gen_ai_semconv.CLAUDE_TOOLS_USED,
     }
 
     @abstractmethod

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import threading
+from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
@@ -30,18 +31,22 @@ MirrorErrorMessage = getattr(claude_agent_sdk, 'MirrorErrorMessage', None)
 from opentelemetry import context as context_api, trace as trace_api
 
 from logfire._internal.integrations.llm_providers.semconv import (
+    AGENT_NAME,
+    CLAUDE_CWD,
     CLAUDE_MODEL_USAGE,
     CLAUDE_PERMISSION_DENIALS,
     CLAUDE_RESULT_ERRORS,
     CLAUDE_RESULT_STRUCTURED_OUTPUT,
     CLAUDE_RESULT_SUBTYPE,
     CLAUDE_RESULT_TEXT,
+    CLAUDE_TOOLS_USED,
     CONVERSATION_ID,
     ERROR_TYPE,
     INPUT_MESSAGES,
     OPERATION_NAME,
     OUTPUT_MESSAGES,
     PROVIDER_NAME,
+    PYDANTIC_AI_ALL_MESSAGES,
     RATE_LIMIT_OVERAGE_DISABLED_REASON,
     RATE_LIMIT_OVERAGE_RESETS_AT,
     RATE_LIMIT_OVERAGE_STATUS,
@@ -373,6 +378,7 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
             OPERATION_NAME: 'invoke_agent',
             PROVIDER_NAME: 'anthropic',
             SYSTEM: 'anthropic',
+            AGENT_NAME: 'claude-code',
         }
         if input_messages:  # pragma: no branch
             span_data[INPUT_MESSAGES] = input_messages
@@ -381,6 +387,8 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
             if system_prompt:  # pragma: no branch
                 text = str(system_prompt)
                 span_data[SYSTEM_INSTRUCTIONS] = [TextPart(type='text', content=text)]
+            if cwd := getattr(self.options, 'cwd', None):
+                span_data[CLAUDE_CWD] = str(cwd)
 
         with logfire_claude.span('invoke_agent', **span_data) as root_span:
             state = _ConversationState(
@@ -563,8 +571,30 @@ class _ConversationState:
             self._current_span.set_level('error')
 
     def close(self) -> None:
-        """Close chat span and end any orphaned tool spans."""
+        """Close chat span and end any orphaned tool spans.
+
+        Also finalises the root span with ``pydantic_ai.all_messages`` (the
+        attribute that triggers logfire's "Agent Run" UI rendering on the
+        root span) and ``claude.tools_used`` (per-tool invocation counts).
+        """
         self.close_chat_span()
+        # Snapshot under anyio: hooks can append to _history concurrently, so
+        # iterate a copy rather than the live list to avoid a theoretical race
+        # (list.append is safe; our walk is not atomic across the two reads).
+        history_snapshot = list(self._history)
+        if history_snapshot:
+            self.root_span.set_attribute(PYDANTIC_AI_ALL_MESSAGES, history_snapshot)
+            tool_counts = Counter(
+                name
+                for msg in history_snapshot
+                for part in msg.get('parts', [])
+                if part.get('type') == 'tool_call' and (name := part.get('name'))
+            )
+            if tool_counts:
+                self.root_span.set_attribute(
+                    CLAUDE_TOOLS_USED,
+                    [{'tool': n, 'count': c} for n, c in tool_counts.items()],
+                )
         for span in self.active_tool_spans.values():
             span._end()  # pyright: ignore[reportPrivateUsage]
         self.active_tool_spans.clear()

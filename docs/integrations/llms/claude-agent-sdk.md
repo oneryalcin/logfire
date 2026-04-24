@@ -107,6 +107,15 @@ The `invoke_agent` span carries the conversation-level summary extracted from `R
 
 The `claude.*` attributes except `claude.permission_denials` are added to Logfire's scrubber allowlist so model-generated content and user-supplied schemas pass through intact. `claude.permission_denials` entries contain the caller-supplied `tool_input` (arbitrary user data) and deliberately remain subject to default scrubbing.
 
+## Agent Run view on the root span
+
+The `invoke_agent` root span is finalised with the full conversation and aggregate metadata for dashboarding:
+
+- `pydantic_ai.all_messages` — full conversation (user prompt, assistant turns, tool invocations, tool responses). This is the attribute that triggers Logfire's "Agent Run" chat-view rendering on the root span; without it the root only shows metadata and you have to drill into per-turn `chat` spans. The attribute name is a Logfire UI convention (originally established by `pydantic-ai`) and is already allowlisted by the scrubber.
+- `claude.tools_used` — aggregated invocation counts as `[{"tool": name, "count": n}, ...]` across client, MCP, and server tools. Useful for dashboards that summarise tool usage per session without needing to traverse the message array.
+- `gen_ai.agent.name` — the agent framework identifier (currently fixed to `claude-code`).
+- `claude.cwd` — the working directory from `ClaudeAgentOptions.cwd`, when set. Intentionally under the `claude.*` namespace rather than `session.*` so value-level scrubbing (e.g. paths containing `secret` / `private_key` / `auth`) still applies.
+
 The resulting trace looks like this in Logfire:
 
 ![Logfire Claude Agent SDK Trace](../../images/logfire-screenshot-claude-agent-sdk.png)

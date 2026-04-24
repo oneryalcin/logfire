@@ -311,6 +311,130 @@ async def test_record_result_is_error_escalates_span_level(exporter: TestExporte
     assert root_span['attributes']['claude.result.errors'] == ['hit max_turns cap']
 
 
+def _user_msg(text: str) -> Any:
+    """Test helper — build a minimal ``gen_ai.input.messages``-shaped user message."""
+    return {'role': 'user', 'parts': [{'type': 'text', 'content': text}]}
+
+
+def _drive_state_through_turns(state: _ConversationState, turns: list[AssistantMessage]) -> None:
+    """Drive ``_ConversationState`` through assistant turns via the public
+    ``handle_assistant_message`` / ``handle_user_message`` / ``close``
+    API — no reaching into ``_history`` / ``_current_output_parts``.
+
+    The first turn uses the already-open chat span from ``open_chat_span()``;
+    subsequent turns call ``handle_user_message()`` to close the prior span
+    and open a new one (the same state-machine trigger the real receive loop
+    uses when a UserMessage arrives in the stream).
+    """
+    state.open_chat_span()
+    for i, turn in enumerate(turns):
+        if i > 0:
+            state.handle_user_message()
+        state.handle_assistant_message(turn)
+
+
+@pytest.mark.anyio
+async def test_close_sets_pydantic_ai_all_messages(exporter: TestExporter) -> None:
+    """``_ConversationState.close()`` copies ``_history`` onto the root span
+    as ``pydantic_ai.all_messages``.
+
+    Locked as a test because this attribute is what flips logfire's UI
+    from generic-span rendering to the full "Agent Run" view (full
+    conversation on the root span). A regression that empties ``_history``
+    or renames the attribute silently removes the root-span UI treatment
+    without breaking any chat-span-level snapshot.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[_user_msg('hi')])
+        _drive_state_through_turns(
+            state,
+            [AssistantMessage(content=[TextBlock(text='hello')], model='claude-sonnet-4-6')],
+        )
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    all_messages = root_attrs['pydantic_ai.all_messages']
+    assert [m['role'] for m in all_messages] == ['user', 'assistant']
+    assert all_messages[0]['parts'][0]['content'] == 'hi'
+    assert all_messages[1]['parts'][0]['content'] == 'hello'
+
+
+@pytest.mark.anyio
+async def test_close_aggregates_tools_used_from_history(exporter: TestExporter) -> None:
+    """``_ConversationState.close()`` walks ``_history`` and emits a
+    ``claude.tools_used`` aggregate count per tool on the root span.
+
+    Covers client tools, MCP tools, and server tools uniformly — they all
+    appear as ``type='tool_call'`` parts in history, so one pass counts all.
+    Mixed-role: also adds a ``role='tool'`` message carrying a
+    ``tool_call_response`` part which must NOT be counted (those are
+    responses, not invocations).
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[_user_msg('q')])
+        _drive_state_through_turns(
+            state,
+            [
+                AssistantMessage(
+                    content=[
+                        ToolUseBlock(id='t1', name='Bash', input={}),
+                        ToolUseBlock(id='t2', name='Read', input={}),
+                    ],
+                    model='claude-sonnet-4-6',
+                ),
+                AssistantMessage(
+                    content=[
+                        ToolUseBlock(id='t3', name='Bash', input={}),
+                        TextBlock(text='done'),
+                    ],
+                    model='claude-sonnet-4-6',
+                ),
+            ],
+        )
+        # A tool-response message — must not be counted as an invocation.
+        state.add_tool_result(tool_use_id='t3', tool_name='Bash', result='ok')
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    counts = {entry['tool']: entry['count'] for entry in root_attrs['claude.tools_used']}
+    assert counts == {'Bash': 2, 'Read': 1}
+
+
+@pytest.mark.anyio
+async def test_close_skips_tools_used_when_no_tool_calls(exporter: TestExporter) -> None:
+    """Text-only conversation → no ``claude.tools_used`` attribute."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[_user_msg('hi')])
+        _drive_state_through_turns(
+            state,
+            [AssistantMessage(content=[TextBlock(text='hello')], model='claude-sonnet-4-6')],
+        )
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    assert 'claude.tools_used' not in root_attrs
+
+
+@pytest.mark.anyio
+async def test_close_skips_pydantic_ai_all_messages_when_history_empty(exporter: TestExporter) -> None:
+    """Empty ``_history`` (no prompt, no turns) → no ``pydantic_ai.all_messages``
+    attribute on the root span."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    assert 'pydantic_ai.all_messages' not in root_attrs
+
+
 def test_server_tool_result_persists_under_assistant_role_in_history() -> None:
     """Server-tool ``tool_call_response`` parts stay under ``role='assistant'``
     in conversation history, not promoted to ``role='tool'``.
@@ -787,6 +911,7 @@ async def test_basic_conversation_cassette(
                     'gen_ai.operation.name': 'invoke_agent',
                     'gen_ai.provider.name': 'anthropic',
                     'gen_ai.system': 'anthropic',
+                    'gen_ai.agent.name': 'claude-code',
                     'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
                     'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
                     'logfire.msg_template': 'invoke_agent',
@@ -818,12 +943,17 @@ async def test_basic_conversation_cassette(
                     'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
+                    'pydantic_ai.all_messages': [
+                        {'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]},
+                        {'role': 'assistant', 'parts': [{'type': 'text', 'content': '4'}]},
+                    ],
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
                             'gen_ai.operation.name': {},
                             'gen_ai.provider.name': {},
                             'gen_ai.system': {},
+                            'gen_ai.agent.name': {},
                             'gen_ai.input.messages': {'type': 'array'},
                             'gen_ai.system_instructions': {'type': 'array'},
                             'gen_ai.usage.input_tokens': {},
@@ -841,6 +971,7 @@ async def test_basic_conversation_cassette(
                             'gen_ai.response.finish_reasons': {'type': 'array'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
+                            'pydantic_ai.all_messages': {'type': 'array'},
                         },
                     },
                 },
@@ -1295,6 +1426,7 @@ async def test_server_tool_blocks_cassette(
                     'gen_ai.operation.name': 'invoke_agent',
                     'gen_ai.provider.name': 'anthropic',
                     'gen_ai.system': 'anthropic',
+                    'gen_ai.agent.name': 'claude-code',
                     'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
                     'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
                     'logfire.msg_template': 'invoke_agent',
@@ -1326,12 +1458,35 @@ async def test_server_tool_blocks_cassette(
                     'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
+                    'pydantic_ai.all_messages': [
+                        {'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]},
+                        {
+                            'role': 'assistant',
+                            'parts': [
+                                {'type': 'text', 'content': 'Checking with advisor.'},
+                                {
+                                    'type': 'tool_call',
+                                    'id': 'srv_use_cass_001',
+                                    'name': 'advisor',
+                                    'arguments': {'question': 'Is 2+2 = 4?'},
+                                },
+                                {
+                                    'type': 'tool_call_response',
+                                    'id': 'srv_use_cass_001',
+                                    'response': {'type': 'advisor_tool_result', 'summary': 'Yes, 2+2=4.'},
+                                },
+                                {'type': 'text', 'content': '4'},
+                            ],
+                        },
+                    ],
+                    'claude.tools_used': [{'tool': 'advisor', 'count': 1}],
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
                             'gen_ai.operation.name': {},
                             'gen_ai.provider.name': {},
                             'gen_ai.system': {},
+                            'gen_ai.agent.name': {},
                             'gen_ai.input.messages': {'type': 'array'},
                             'gen_ai.system_instructions': {'type': 'array'},
                             'gen_ai.usage.input_tokens': {},
@@ -1349,6 +1504,8 @@ async def test_server_tool_blocks_cassette(
                             'gen_ai.response.finish_reasons': {'type': 'array'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
+                            'pydantic_ai.all_messages': {'type': 'array'},
+                            'claude.tools_used': {'type': 'array'},
                         },
                     },
                 },
@@ -1516,6 +1673,7 @@ async def test_ratelimit_and_mirror_error_cassette(
                     'gen_ai.operation.name': 'invoke_agent',
                     'gen_ai.provider.name': 'anthropic',
                     'gen_ai.system': 'anthropic',
+                    'gen_ai.agent.name': 'claude-code',
                     'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
                     'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
                     'logfire.msg_template': 'invoke_agent',
@@ -1547,12 +1705,17 @@ async def test_ratelimit_and_mirror_error_cassette(
                     'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
+                    'pydantic_ai.all_messages': [
+                        {'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]},
+                        {'role': 'assistant', 'parts': [{'type': 'text', 'content': '4'}]},
+                    ],
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
                             'gen_ai.operation.name': {},
                             'gen_ai.provider.name': {},
                             'gen_ai.system': {},
+                            'gen_ai.agent.name': {},
                             'gen_ai.input.messages': {'type': 'array'},
                             'gen_ai.system_instructions': {'type': 'array'},
                             'gen_ai.usage.input_tokens': {},
@@ -1570,6 +1733,7 @@ async def test_ratelimit_and_mirror_error_cassette(
                             'gen_ai.response.finish_reasons': {'type': 'array'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
+                            'pydantic_ai.all_messages': {'type': 'array'},
                         },
                     },
                 },
