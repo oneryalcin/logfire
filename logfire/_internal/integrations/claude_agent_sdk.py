@@ -30,6 +30,12 @@ MirrorErrorMessage = getattr(claude_agent_sdk, 'MirrorErrorMessage', None)
 from opentelemetry import context as context_api, trace as trace_api
 
 from logfire._internal.integrations.llm_providers.semconv import (
+    CLAUDE_MODEL_USAGE,
+    CLAUDE_PERMISSION_DENIALS,
+    CLAUDE_RESULT_ERRORS,
+    CLAUDE_RESULT_STRUCTURED_OUTPUT,
+    CLAUDE_RESULT_SUBTYPE,
+    CLAUDE_RESULT_TEXT,
     CONVERSATION_ID,
     ERROR_TYPE,
     INPUT_MESSAGES,
@@ -45,6 +51,7 @@ from logfire._internal.integrations.llm_providers.semconv import (
     RATE_LIMIT_TYPE,
     RATE_LIMIT_UTILIZATION,
     REQUEST_MODEL,
+    RESPONSE_FINISH_REASONS,
     RESPONSE_MODEL,
     SYSTEM,
     SYSTEM_INSTRUCTIONS,
@@ -641,12 +648,41 @@ def _record_result(span: LogfireSpan, msg: ResultMessage) -> None:
     if session_id is not None:  # pragma: no branch
         attrs[CONVERSATION_ID] = session_id
 
-    for attr in ('num_turns', 'duration_ms'):
-        if (value := getattr(msg, attr, None)) is not None:  # pragma: no branch
-            attrs[attr] = value
+    # Pass-through if not None (preserves empty string / empty dict for
+    # ``claude.result.text`` and ``claude.result.structured_output``). These
+    # claude.* attributes are added to ``scrubbing.SAFE_KEYS`` so model-
+    # generated content and user-supplied schemas are not regex-scrubbed.
+    for src, dst in (
+        ('num_turns', 'num_turns'),
+        ('duration_ms', 'duration_ms'),
+        ('duration_api_ms', 'duration_api_ms'),
+        ('subtype', CLAUDE_RESULT_SUBTYPE),
+        ('result', CLAUDE_RESULT_TEXT),
+        ('structured_output', CLAUDE_RESULT_STRUCTURED_OUTPUT),
+    ):
+        if (value := getattr(msg, src, None)) is not None:
+            attrs[dst] = value
+
+    # OTel semconv: finish_reasons is an array even with a single value.
+    if (stop_reason := getattr(msg, 'stop_reason', None)) is not None:
+        attrs[RESPONSE_FINISH_REASONS] = [stop_reason]
+
+    # Per-model usage breakdown. Useful when fallback_model kicks in and
+    # aggregate gen_ai.usage.* no longer attributes tokens to one model.
+    if model_usage := getattr(msg, 'model_usage', None):
+        attrs[CLAUDE_MODEL_USAGE] = model_usage
+
+    # Truthy guards skip the empty-list happy path for these audit fields.
+    # Note: claude.permission_denials is NOT scrub-exempt — denial entries
+    # carry user-supplied ``tool_input`` where redaction is the safer default.
+    if denials := getattr(msg, 'permission_denials', None):
+        attrs[CLAUDE_PERMISSION_DENIALS] = denials
+
+    if errors := getattr(msg, 'errors', None):
+        attrs[CLAUDE_RESULT_ERRORS] = errors
 
     span.set_attributes(attrs)
 
     is_error = getattr(msg, 'is_error', None)
-    if is_error:  # pragma: no cover
+    if is_error:
         span.set_level('error')

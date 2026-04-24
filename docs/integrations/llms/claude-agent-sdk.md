@@ -92,6 +92,21 @@ The integration also surfaces two non-message stream events as logs nested under
 - **Rate-limit transitions** (`RateLimitEvent`): emitted whenever the CLI reports a rate-limit state change (`allowed` → `allowed_warning` → `rejected`) or overage state, with `gen_ai.rate_limit.status`, `.type`, `.utilization`, `.resets_at`, and a `.raw` passthrough. `rejected` escalates the enclosing `invoke_agent` span to error level.
 - **Session-store mirror errors** (`MirrorErrorMessage`): error-level logs when the configured `SessionStore` fails to mirror a transcript line. The local-disk transcript is unaffected.
 
+## End-of-conversation result fields
+
+The `invoke_agent` span carries the conversation-level summary extracted from `ResultMessage`:
+
+- `duration_api_ms` — time spent waiting on the Anthropic API (vs `duration_ms`, the total wall clock).
+- `gen_ai.response.finish_reasons` — the per-model stop reason as an OTel semconv array (e.g. `["end_turn"]`, `["max_tokens"]`).
+- `claude.result.subtype` — conversation-level end state: `success` / `error_max_turns` / `error_during_execution`. Distinct from `finish_reasons`.
+- `claude.result.text` — the final aggregated response text.
+- `claude.result.errors` — list of diagnostic error strings encountered during the run, if any.
+- `claude.result.structured_output` — the structured payload when `output_format` is configured.
+- `claude.model_usage` — per-model token breakdown (useful when `fallback_model` kicks in and the aggregate `gen_ai.usage.*` no longer attributes tokens to a single model).
+- `claude.permission_denials` — list of tool-permission denials recorded by the CLI.
+
+The `claude.*` attributes except `claude.permission_denials` are added to Logfire's scrubber allowlist so model-generated content and user-supplied schemas pass through intact. `claude.permission_denials` entries contain the caller-supplied `tool_input` (arbitrary user data) and deliberately remain subject to default scrubbing.
+
 The resulting trace looks like this in Logfire:
 
 ![Logfire Claude Agent SDK Trace](../../images/logfire-screenshot-claude-agent-sdk.png)
