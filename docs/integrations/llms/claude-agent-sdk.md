@@ -116,6 +116,17 @@ The `invoke_agent` root span is finalised with the full conversation and aggrega
 - `gen_ai.agent.name` — the agent framework identifier (currently fixed to `claude-code`).
 - `claude.cwd` — the working directory from `ClaudeAgentOptions.cwd`, when set. Intentionally under the `claude.*` namespace rather than `session.*` so value-level scrubbing (e.g. paths containing `secret` / `private_key` / `auth`) still applies.
 
+## Per-turn chat span attributes
+
+Each `chat` child span carries per-turn identifiers derived from the `AssistantMessage` that closed the turn:
+
+- `gen_ai.response.id` — the Anthropic API message id (e.g. `msg_01ABC...`). Directly queryable from the Anthropic API console.
+- `gen_ai.response.finish_reasons` — the per-turn stop reason as a single-element array (`["end_turn"]`, `["tool_use"]`, `["max_tokens"]`, …). Also surfaced on the `invoke_agent` root span from `ResultMessage.stop_reason` at conversation level — filter by span name when aggregating to avoid double-counting.
+- `claude.message.uuid` — the SDK-side stream UUID for the AssistantMessage. Distinct from `gen_ai.response.id` (the API id): useful for correlating with SDK-local logs or offline replays that don't hit the Anthropic API.
+- `claude.parent_tool_use_id` — set when an `AssistantMessage` is produced by a subagent spawned via a ToolUse; carries the parent ToolUse id for stitching subagent turns back to the parent agent's tool call.
+
+When the SDK emits multiple `AssistantMessage`s on the same chat span (text followed by a tool_use call from one API response, for example), these per-turn identifiers are last-write-wins — the final `message_id` / `stop_reason` is authoritative for the turn, matching the accumulating behaviour of `gen_ai.output.messages`.
+
 The resulting trace looks like this in Logfire:
 
 ![Logfire Claude Agent SDK Trace](../../images/logfire-screenshot-claude-agent-sdk.png)

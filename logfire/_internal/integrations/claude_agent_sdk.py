@@ -33,7 +33,9 @@ from opentelemetry import context as context_api, trace as trace_api
 from logfire._internal.integrations.llm_providers.semconv import (
     AGENT_NAME,
     CLAUDE_CWD,
+    CLAUDE_MESSAGE_UUID,
     CLAUDE_MODEL_USAGE,
+    CLAUDE_PARENT_TOOL_USE_ID,
     CLAUDE_PERMISSION_DENIALS,
     CLAUDE_RESULT_ERRORS,
     CLAUDE_RESULT_STRUCTURED_OUTPUT,
@@ -57,6 +59,7 @@ from logfire._internal.integrations.llm_providers.semconv import (
     RATE_LIMIT_UTILIZATION,
     REQUEST_MODEL,
     RESPONSE_FINISH_REASONS,
+    RESPONSE_ID,
     RESPONSE_MODEL,
     SYSTEM,
     SYSTEM_INSTRUCTIONS,
@@ -564,6 +567,26 @@ class _ConversationState:
         usage = getattr(message, 'usage', None)
         if usage:  # pragma: no branch
             self._current_span.set_attributes(_extract_usage(usage, partial=True))
+
+        # Per-turn identifiers; see the CLAUDE_* constants' comment for the
+        # message_id / uuid / parent_tool_use_id distinction. When the SDK
+        # emits multiple AssistantMessages on the same chat span (e.g. text
+        # + tool_use from one API call), these are last-write-wins — the
+        # final message_id/stop_reason is the authoritative one for the
+        # turn, matching OUTPUT_MESSAGES which accumulates.
+        attrs: dict[str, Any] = {}
+        for src, dst in (
+            ('message_id', RESPONSE_ID),
+            ('uuid', CLAUDE_MESSAGE_UUID),
+            ('parent_tool_use_id', CLAUDE_PARENT_TOOL_USE_ID),
+        ):
+            if (value := getattr(message, src, None)) is not None:
+                attrs[dst] = value
+        # OTel semconv: finish_reasons is an array even with a single value.
+        if (stop_reason := getattr(message, 'stop_reason', None)) is not None:
+            attrs[RESPONSE_FINISH_REASONS] = [stop_reason]
+        if attrs:
+            self._current_span.set_attributes(attrs)
 
         error = getattr(message, 'error', None)
         if error:  # pragma: no cover

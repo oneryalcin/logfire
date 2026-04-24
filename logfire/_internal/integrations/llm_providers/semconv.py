@@ -135,6 +135,12 @@ CLAUDE_PERMISSION_DENIALS = 'claude.permission_denials'
 # ``invoke_agent`` root span at close for dashboards that group by tool.
 CLAUDE_TOOLS_USED = 'claude.tools_used'
 
+# SDK-internal per-AssistantMessage ids, distinct from the Anthropic API
+# message_id captured under ``gen_ai.response.id``. ``parent_tool_use_id``
+# stitches subagent responses back to the ToolUse that spawned them.
+CLAUDE_MESSAGE_UUID = 'claude.message.uuid'
+CLAUDE_PARENT_TOOL_USE_ID = 'claude.parent_tool_use_id'
+
 # Type definitions for message parts and messages
 
 
