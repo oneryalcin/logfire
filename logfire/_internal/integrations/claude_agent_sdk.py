@@ -11,6 +11,8 @@ from claude_agent_sdk import (
     AssistantMessage,
     HookMatcher,
     ResultMessage,
+    ServerToolResultBlock,
+    ServerToolUseBlock,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -104,12 +106,18 @@ def _content_blocks_to_output_messages(content: Any) -> list[OutputMessage]:
     if not isinstance(content, list):
         return []
 
-    for block in cast('list[TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock | Any]', content):
+    for block in cast('list[Any]', content):
         if isinstance(block, TextBlock):
             parts.append(TextPart(type='text', content=block.text))
         elif isinstance(block, ThinkingBlock):
             parts.append(ReasoningPart(type='reasoning', content=block.thinking))
-        elif isinstance(block, ToolUseBlock):
+        elif isinstance(block, (ToolUseBlock, ServerToolUseBlock)):
+            # ServerToolUseBlock mirrors ToolUseBlock's shape; `name` discriminates
+            # server tools (web_search, code_execution, etc.). Note: the SDK's
+            # message parser currently only constructs ServerToolResultBlock for
+            # `advisor_tool_result`; results for other server tools are dropped
+            # upstream, so those `tool_call` parts may appear without a matching
+            # `tool_call_response` — an SDK limitation, not an integration bug.
             part = ToolCallPart(
                 type='tool_call',
                 id=block.id or '',
@@ -117,7 +125,7 @@ def _content_blocks_to_output_messages(content: Any) -> list[OutputMessage]:
             )
             part['arguments'] = block.input
             parts.append(part)
-        elif isinstance(block, ToolResultBlock):
+        elif isinstance(block, (ToolResultBlock, ServerToolResultBlock)):
             parts.append(
                 ToolCallResponsePart(
                     type='tool_call_response',
