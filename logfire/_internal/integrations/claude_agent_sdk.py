@@ -18,6 +18,13 @@ from claude_agent_sdk import (
     UserMessage,
 )
 from claude_agent_sdk.types import HookContext, SyncHookJSONOutput
+
+# Optional message types — resolved at module load from the installed SDK so
+# older versions that lack them still import cleanly. Using getattr avoids
+# a redundant try/except on a module we've already imported above.
+RateLimitEvent = getattr(claude_agent_sdk, 'RateLimitEvent', None)
+MirrorErrorMessage = getattr(claude_agent_sdk, 'MirrorErrorMessage', None)
+
 from opentelemetry import context as context_api, trace as trace_api
 
 from logfire._internal.integrations.llm_providers.semconv import (
@@ -27,6 +34,14 @@ from logfire._internal.integrations.llm_providers.semconv import (
     OPERATION_NAME,
     OUTPUT_MESSAGES,
     PROVIDER_NAME,
+    RATE_LIMIT_OVERAGE_DISABLED_REASON,
+    RATE_LIMIT_OVERAGE_RESETS_AT,
+    RATE_LIMIT_OVERAGE_STATUS,
+    RATE_LIMIT_RAW,
+    RATE_LIMIT_RESETS_AT,
+    RATE_LIMIT_STATUS,
+    RATE_LIMIT_TYPE,
+    RATE_LIMIT_UTILIZATION,
     REQUEST_MODEL,
     RESPONSE_MODEL,
     SYSTEM,
@@ -46,6 +61,11 @@ from logfire._internal.integrations.llm_providers.semconv import (
 from logfire._internal.utils import handle_internal_errors
 
 if TYPE_CHECKING:
+    # String forward refs for the SDK types that may be absent at runtime on
+    # older SDK versions (see getattr above).
+    from claude_agent_sdk import MirrorErrorMessage as _MirrorErrorMessage
+    from claude_agent_sdk import RateLimitEvent as _RateLimitEvent
+
     from logfire._internal.main import Logfire, LogfireSpan
 
 
@@ -365,11 +385,15 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
                             state.handle_assistant_message(msg)
                         elif isinstance(msg, UserMessage):
                             state.handle_user_message()
-                        elif isinstance(msg, ResultMessage):  # pragma: no branch
+                        elif isinstance(msg, ResultMessage):
                             _record_result(root_span, msg)
                             if state.model:  # pragma: no branch
                                 root_span.set_attribute(REQUEST_MODEL, state.model)
                                 root_span.set_attribute(RESPONSE_MODEL, state.model)
+                        elif RateLimitEvent is not None and isinstance(msg, RateLimitEvent):
+                            _record_rate_limit_event(logfire_claude, root_span, msg)
+                        elif MirrorErrorMessage is not None and isinstance(msg, MirrorErrorMessage):
+                            _record_mirror_error(logfire_claude, msg)
 
                     yield msg
             finally:
@@ -529,6 +553,70 @@ class _ConversationState:
         for span in self.active_tool_spans.values():
             span._end()  # pyright: ignore[reportPrivateUsage]
         self.active_tool_spans.clear()
+
+
+def _record_rate_limit_event(
+    logfire_instance: Logfire, root_span: LogfireSpan, msg: _RateLimitEvent
+) -> None:
+    """Record a RateLimitEvent as a level-appropriate log under the root span.
+
+    The SDK emits these whenever the CLI reports a rate-limit state transition
+    (``allowed`` → ``allowed_warning`` → ``rejected``), plus overage state. We
+    surface them as logfire events so alerting can key off them.
+    """
+    info = getattr(msg, 'rate_limit_info', None)
+    status = getattr(info, 'status', None)
+    attrs: dict[str, Any] = {RATE_LIMIT_STATUS: status}
+    # Map SDK field → semconv constant. Only emit set values.
+    field_map: tuple[tuple[str, str], ...] = (
+        ('resets_at', RATE_LIMIT_RESETS_AT),
+        ('rate_limit_type', RATE_LIMIT_TYPE),
+        ('utilization', RATE_LIMIT_UTILIZATION),
+        ('overage_status', RATE_LIMIT_OVERAGE_STATUS),
+        ('overage_resets_at', RATE_LIMIT_OVERAGE_RESETS_AT),
+        ('overage_disabled_reason', RATE_LIMIT_OVERAGE_DISABLED_REASON),
+        ('raw', RATE_LIMIT_RAW),
+    )
+    for sdk_field, attr_name in field_map:
+        val = getattr(info, sdk_field, None)
+        if val:
+            attrs[attr_name] = val
+    conv_id = getattr(msg, 'session_id', None)
+    if conv_id is not None:
+        attrs[CONVERSATION_ID] = conv_id
+
+    if status == 'rejected':
+        attrs[ERROR_TYPE] = 'RateLimitRejected'
+        root_span.set_level('error')
+        log = logfire_instance.error
+    elif status == 'allowed_warning':
+        log = logfire_instance.warn
+    else:
+        log = logfire_instance.info
+    log('rate_limit {status}', status=status, **attrs)
+
+
+def _record_mirror_error(logfire_instance: Logfire, msg: _MirrorErrorMessage) -> None:
+    """Record a MirrorErrorMessage as an error-level log under the root span.
+
+    Mirror errors are non-fatal (the local transcript is still durable) but
+    indicate drift from an external SessionStore — worth surfacing. The raw
+    SessionKey dict is unpacked into individual attributes (``session_id`` →
+    ``gen_ai.conversation.id``, plus ``project_key`` / ``subpath``) rather
+    than serialized whole, because logfire's default scrubber matches the
+    substring ``session`` in attribute values and would redact the whole blob.
+    """
+    error = getattr(msg, 'error', '') or ''
+    attrs: dict[str, Any] = {ERROR_TYPE: 'MirrorError'}
+    key = getattr(msg, 'key', None)
+    if isinstance(key, dict):
+        if (sid := key.get('session_id')) is not None:
+            attrs[CONVERSATION_ID] = sid
+        if (pk := key.get('project_key')) is not None:
+            attrs['mirror.project_key'] = pk
+        if (sp := key.get('subpath')) is not None:
+            attrs['mirror.subpath'] = sp
+    logfire_instance.error('mirror store error: {error}', error=error, **attrs)
 
 
 def _record_result(span: LogfireSpan, msg: ResultMessage) -> None:
