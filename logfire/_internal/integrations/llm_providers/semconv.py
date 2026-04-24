@@ -91,6 +91,17 @@ CONVERSATION_ID = 'gen_ai.conversation.id'
 # Error
 ERROR_TYPE = 'error.type'
 
+# Rate-limit (custom extension; not yet in upstream OTel gen-ai semconv).
+# Surfaced by the Claude Agent SDK as RateLimitEvent messages.
+RATE_LIMIT_STATUS = 'gen_ai.rate_limit.status'
+RATE_LIMIT_TYPE = 'gen_ai.rate_limit.type'
+RATE_LIMIT_UTILIZATION = 'gen_ai.rate_limit.utilization'
+RATE_LIMIT_RESETS_AT = 'gen_ai.rate_limit.resets_at'
+RATE_LIMIT_OVERAGE_STATUS = 'gen_ai.rate_limit.overage.status'
+RATE_LIMIT_OVERAGE_RESETS_AT = 'gen_ai.rate_limit.overage.resets_at'
+RATE_LIMIT_OVERAGE_DISABLED_REASON = 'gen_ai.rate_limit.overage.disabled_reason'
+RATE_LIMIT_RAW = 'gen_ai.rate_limit.raw'
+
 # Type definitions for message parts and messages
 
 

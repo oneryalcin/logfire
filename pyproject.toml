@@ -197,7 +197,7 @@ dev = [
     "pytest-examples>=0.0.18",
     "pytest-timeout>=2.4.0",
     "pytest-asyncio>=0.24.0",
-    "claude-agent-sdk>=0 ; python_full_version >= '3.10'",
+    "claude-agent-sdk>=0.1.62 ; python_full_version >= '3.10'",
 ]
 docs = [
     "black>=23.12.0",
@@ -235,6 +235,8 @@ pydantic-graph = false
 pydantic-evals = false
 pydantic = false
 pydantic-core = false
+# Dev-only dep; upgrade freely so the version pin (>= 0.1.62) can resolve.
+claude-agent-sdk = false
 
 [tool.uv.workspace]
 members = ["logfire-api"]

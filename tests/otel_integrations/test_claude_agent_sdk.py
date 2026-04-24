@@ -19,6 +19,7 @@ import shutil
 import stat
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -45,6 +46,8 @@ from logfire._internal.integrations.claude_agent_sdk import (
     _ConversationState,
     _extract_usage,
     _inject_tracing_hooks,
+    _record_mirror_error,
+    _record_rate_limit_event,
     _set_state,
     post_tool_use_failure_hook,
     post_tool_use_hook,
@@ -999,3 +1002,248 @@ uv.lock\
             },
         ]
     )
+
+
+@pytest.mark.anyio
+async def test_ratelimit_and_mirror_error_cassette(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, exporter: TestExporter
+) -> None:
+    """RateLimitEvent and MirrorErrorMessage in the stream produce log spans.
+
+    The cassette is basic_conversation.json with two extra ``recv`` entries
+    spliced in right after ``system/init``: a ``rate_limit_event`` with
+    status ``allowed_warning`` and a ``system/mirror_error``. This exercises
+    the branches added for logfire issue #2.
+    """
+    record = request.config.getoption('--record-claude-cassettes', default=False)
+    # Recording is not meaningful for this cassette — mirror_error is
+    # SDK-synthesized (not emitted by the CLI) and rate_limit_event requires
+    # a real rate-limit transition. The cassette is hand-assembled; skip the
+    # record path so CI never tries to overwrite it.
+    if record:  # pragma: no cover
+        pytest.skip('ratelimit_mirror_conversation.json is hand-assembled, not recorded')
+
+    import claude_agent_sdk as _sdk
+
+    if not hasattr(_sdk, 'RateLimitEvent') or not hasattr(_sdk, 'MirrorErrorMessage'):
+        pytest.skip('SDK version lacks RateLimitEvent / MirrorErrorMessage — needs claude-agent-sdk >= 0.1.62')
+
+    client = _make_client('ratelimit_mirror_conversation.json', monkeypatch=monkeypatch)
+    try:
+        await client.connect()
+        await client.query('What is 2+2?')
+        collected = [msg async for msg in client.receive_response()]
+    finally:
+        await _close_sdk_streams(client)
+        await client.disconnect()
+
+    # SDK itself should have yielded both messages through to the caller.
+    assert any(isinstance(m, _sdk.RateLimitEvent) for m in collected), 'SDK did not yield RateLimitEvent'
+    assert any(isinstance(m, _sdk.MirrorErrorMessage) for m in collected), 'SDK did not yield MirrorErrorMessage'
+
+    assert exporter.exported_spans_as_dict(parse_json_attributes=True) == snapshot(
+        [
+            {
+                'name': 'rate_limit {status}',
+                'context': {'trace_id': 1, 'span_id': 5, 'is_remote': False},
+                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'start_time': 3000000000,
+                'end_time': 3000000000,
+                'attributes': {
+                    'logfire.span_type': 'log',
+                    'logfire.level_num': 13,
+                    'logfire.msg_template': 'rate_limit {status}',
+                    'logfire.msg': 'rate_limit allowed_warning',
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
+                    'code.lineno': 123,
+                    'status': 'allowed_warning',
+                    'gen_ai.rate_limit.status': 'allowed_warning',
+                    'gen_ai.rate_limit.resets_at': 1800000000,
+                    'gen_ai.rate_limit.type': 'five_hour',
+                    'gen_ai.rate_limit.utilization': 0.87,
+                    'gen_ai.rate_limit.raw': {
+                        'status': 'allowed_warning',
+                        'resetsAt': 1800000000,
+                        'rateLimitType': 'five_hour',
+                        'utilization': 0.87,
+                    },
+                    'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'status': {},
+                            'gen_ai.rate_limit.status': {},
+                            'gen_ai.rate_limit.resets_at': {},
+                            'gen_ai.rate_limit.type': {},
+                            'gen_ai.rate_limit.utilization': {},
+                            'gen_ai.rate_limit.raw': {'type': 'object'},
+                            'gen_ai.conversation.id': {},
+                        },
+                    },
+                },
+            },
+            {
+                'name': 'mirror store error: {error}',
+                'context': {'trace_id': 1, 'span_id': 6, 'is_remote': False},
+                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'start_time': 4000000000,
+                'end_time': 4000000000,
+                'attributes': {
+                    'logfire.span_type': 'log',
+                    'logfire.level_num': 17,
+                    'logfire.msg_template': 'mirror store error: {error}',
+                    'logfire.msg': 'mirror store error: store append timed out',
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
+                    'code.lineno': 123,
+                    'error': 'store append timed out',
+                    'error.type': 'MirrorError',
+                    'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {'error': {}, 'error.type': {}, 'gen_ai.conversation.id': {}},
+                    },
+                },
+            },
+            {
+                'name': 'chat claude-sonnet-4-6',
+                'context': {'trace_id': 1, 'span_id': 3, 'is_remote': False},
+                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'start_time': 2000000000,
+                'end_time': 5000000000,
+                'attributes': {
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
+                    'code.lineno': 123,
+                    'gen_ai.operation.name': 'chat',
+                    'gen_ai.provider.name': 'anthropic',
+                    'gen_ai.system': 'anthropic',
+                    'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
+                    'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
+                    'logfire.msg_template': 'chat',
+                    'logfire.span_type': 'span',
+                    'gen_ai.output.messages': [{'role': 'assistant', 'parts': [{'type': 'text', 'content': '4'}]}],
+                    'gen_ai.request.model': 'claude-sonnet-4-6',
+                    'gen_ai.response.model': 'claude-sonnet-4-6',
+                    'logfire.msg': 'chat claude-sonnet-4-6',
+                    'gen_ai.usage.partial.input_tokens': 9344,
+                    'gen_ai.usage.partial.output_tokens': 1,
+                    'gen_ai.usage.partial.cache_read.input_tokens': 7166,
+                    'gen_ai.usage.partial.cache_creation.input_tokens': 2175,
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'gen_ai.operation.name': {},
+                            'gen_ai.provider.name': {},
+                            'gen_ai.system': {},
+                            'gen_ai.input.messages': {'type': 'array'},
+                            'gen_ai.system_instructions': {'type': 'array'},
+                            'gen_ai.output.messages': {'type': 'array'},
+                            'gen_ai.request.model': {},
+                            'gen_ai.response.model': {},
+                            'gen_ai.usage.partial.input_tokens': {},
+                            'gen_ai.usage.partial.output_tokens': {},
+                            'gen_ai.usage.partial.cache_read.input_tokens': {},
+                            'gen_ai.usage.partial.cache_creation.input_tokens': {},
+                        },
+                    },
+                },
+            },
+            {
+                'name': 'invoke_agent',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': 1000000000,
+                'end_time': 6000000000,
+                'attributes': {
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
+                    'code.lineno': 123,
+                    'gen_ai.operation.name': 'invoke_agent',
+                    'gen_ai.provider.name': 'anthropic',
+                    'gen_ai.system': 'anthropic',
+                    'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
+                    'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
+                    'logfire.msg_template': 'invoke_agent',
+                    'logfire.msg': 'invoke_agent',
+                    'logfire.span_type': 'span',
+                    'gen_ai.usage.input_tokens': 9344,
+                    'gen_ai.usage.output_tokens': 5,
+                    'gen_ai.usage.cache_read.input_tokens': 7166,
+                    'gen_ai.usage.cache_creation.input_tokens': 2175,
+                    'operation.cost': 0.01039005,
+                    'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
+                    'num_turns': 1,
+                    'duration_ms': 2263,
+                    'gen_ai.request.model': 'claude-sonnet-4-6',
+                    'gen_ai.response.model': 'claude-sonnet-4-6',
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'gen_ai.operation.name': {},
+                            'gen_ai.provider.name': {},
+                            'gen_ai.system': {},
+                            'gen_ai.input.messages': {'type': 'array'},
+                            'gen_ai.system_instructions': {'type': 'array'},
+                            'gen_ai.usage.input_tokens': {},
+                            'gen_ai.usage.output_tokens': {},
+                            'gen_ai.usage.cache_read.input_tokens': {},
+                            'gen_ai.usage.cache_creation.input_tokens': {},
+                            'operation.cost': {},
+                            'gen_ai.conversation.id': {},
+                            'num_turns': {},
+                            'duration_ms': {},
+                            'gen_ai.request.model': {},
+                            'gen_ai.response.model': {},
+                        },
+                    },
+                },
+            },
+        ]
+    )
+
+
+@pytest.mark.anyio
+async def test_rate_limit_rejected_sets_error_level(exporter: TestExporter) -> None:
+    """A ``rate_limit_event`` with status 'rejected' escalates the root span."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        msg = SimpleNamespace(
+            rate_limit_info=SimpleNamespace(
+                status='rejected',
+                resets_at=1800000000,
+                rate_limit_type='five_hour',
+                utilization=1.0,
+                overage_status=None,
+                overage_resets_at=None,
+                overage_disabled_reason=None,
+            ),
+            session_id='sess-abc',
+        )
+        _record_rate_limit_event(logfire_instance, root, msg)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log_spans = [s for s in spans if s['name'] == 'rate_limit {status}']
+    assert len(log_spans) == 1
+    log = log_spans[0]
+    assert log['attributes']['logfire.level_num'] == 17  # error
+    assert log['attributes']['error.type'] == 'RateLimitRejected'
+
+    # Root span itself is escalated to error via set_level.
+    root_spans = [s for s in spans if s['name'] == 'invoke_agent']
+    assert len(root_spans) == 1
+    assert root_spans[0]['attributes']['logfire.level_num'] == 17
+
+
+@pytest.mark.anyio
+async def test_mirror_error_without_key(exporter: TestExporter) -> None:
+    """MirrorErrorMessage with key=None (not every mirror error has one)."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent'):
+        _record_mirror_error(logfire_instance, SimpleNamespace(error='oh no', key=None))
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    mirror = next(s for s in spans if s['name'] == 'mirror store error: {error}')
+    assert mirror['attributes']['error.type'] == 'MirrorError'
+    assert 'gen_ai.conversation.id' not in mirror['attributes']
