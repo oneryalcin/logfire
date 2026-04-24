@@ -51,6 +51,7 @@ from logfire._internal.integrations.claude_agent_sdk import (
     _inject_tracing_hooks,
     _record_mirror_error,
     _record_rate_limit_event,
+    _record_result,
     _set_state,
     post_tool_use_failure_hook,
     post_tool_use_hook,
@@ -209,7 +210,11 @@ def test_content_blocks_to_output_messages() -> None:
         {
             'role': 'assistant',
             'parts': [
-                {'type': 'tool_call_response', 'id': 'srv_1', 'response': {'type': 'advisor_tool_result', 'summary': 'ok'}}
+                {
+                    'type': 'tool_call_response',
+                    'id': 'srv_1',
+                    'response': {'type': 'advisor_tool_result', 'summary': 'ok'},
+                }
             ],
         }
     ]
@@ -219,6 +224,91 @@ def test_content_blocks_to_output_messages() -> None:
     result = _content_blocks_to_output_messages([block])
     assert len(result) == 1
     assert result[0]['parts'][0] is block
+
+
+@pytest.mark.anyio
+async def test_record_result_skips_empty_and_none_fields(exporter: TestExporter) -> None:
+    """``_record_result`` should only set attributes for fields with meaningful
+    values: empty lists (``errors=[]``, ``permission_denials=[]``) and
+    ``None`` values are skipped so happy-path spans don't carry always-empty
+    attributes.
+
+    Locked semantics:
+      * ``errors=[]``        → no ``claude.result.errors`` attribute
+      * ``permission_denials=[]`` → no ``claude.permission_denials``
+      * ``stop_reason=None`` → no ``gen_ai.response.finish_reasons``
+      * ``result=None``      → no ``claude.result.text``
+      * ``structured_output=None`` → no ``claude.result.structured_output``
+      * ``model_usage=None`` → no ``claude.model_usage``
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        msg = SimpleNamespace(
+            usage={'input_tokens': 100, 'output_tokens': 50},
+            total_cost_usd=0.01,
+            session_id='sess-abc',
+            num_turns=1,
+            duration_ms=1000,
+            duration_api_ms=900,
+            subtype='success',
+            stop_reason=None,
+            model_usage=None,
+            permission_denials=[],
+            errors=[],
+            result=None,
+            structured_output=None,
+            is_error=False,
+        )
+        _record_result(root, msg)  # type: ignore[arg-type]
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+
+    # Populated fields are present.
+    assert root_attrs['claude.result.subtype'] == 'success'
+    assert root_attrs['duration_api_ms'] == 900
+    assert root_attrs['num_turns'] == 1
+
+    # Empty / None fields are skipped.
+    for absent in (
+        'gen_ai.response.finish_reasons',
+        'claude.result.text',
+        'claude.model_usage',
+        'claude.permission_denials',
+        'claude.result.errors',
+        'claude.result.structured_output',
+    ):
+        assert absent not in root_attrs, f'{absent!r} should be skipped when empty/None'
+
+
+@pytest.mark.anyio
+async def test_record_result_is_error_escalates_span_level(exporter: TestExporter) -> None:
+    """A ResultMessage with ``is_error=True`` escalates the root span to error."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        msg = SimpleNamespace(
+            usage={'input_tokens': 10, 'output_tokens': 0},
+            total_cost_usd=0.0,
+            session_id='sess-xyz',
+            num_turns=3,
+            duration_ms=500,
+            duration_api_ms=400,
+            subtype='error_max_turns',
+            stop_reason=None,
+            model_usage=None,
+            permission_denials=[],
+            errors=['hit max_turns cap'],
+            result=None,
+            structured_output=None,
+            is_error=True,
+        )
+        _record_result(root, msg)  # type: ignore[arg-type]
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_span = next(s for s in spans if s['name'] == 'invoke_agent')
+    assert root_span['attributes']['logfire.level_num'] == 17  # error
+    assert root_span['attributes']['claude.result.subtype'] == 'error_max_turns'
+    assert root_span['attributes']['claude.result.errors'] == ['hit max_turns cap']
 
 
 def test_server_tool_result_persists_under_assistant_role_in_history() -> None:
@@ -710,6 +800,22 @@ async def test_basic_conversation_cassette(
                     'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
                     'num_turns': 1,
                     'duration_ms': 2263,
+                    'duration_api_ms': 2257,
+                    'claude.result.subtype': 'success',
+                    'claude.result.text': '4',
+                    'claude.model_usage': {
+                        'claude-sonnet-4-6': {
+                            'inputTokens': 3,
+                            'outputTokens': 5,
+                            'cacheReadInputTokens': 7166,
+                            'cacheCreationInputTokens': 2175,
+                            'webSearchRequests': 0,
+                            'costUSD': 0.01039005,
+                            'contextWindow': 200000,
+                            'maxOutputTokens': 32000,
+                        }
+                    },
+                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
                     'logfire.json_schema': {
@@ -728,6 +834,11 @@ async def test_basic_conversation_cassette(
                             'gen_ai.conversation.id': {},
                             'num_turns': {},
                             'duration_ms': {},
+                            'duration_api_ms': {},
+                            'claude.result.subtype': {},
+                            'claude.result.text': {},
+                            'claude.model_usage': {'type': 'object'},
+                            'gen_ai.response.finish_reasons': {'type': 'array'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
                         },
@@ -1197,6 +1308,22 @@ async def test_server_tool_blocks_cassette(
                     'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
                     'num_turns': 1,
                     'duration_ms': 2263,
+                    'duration_api_ms': 2257,
+                    'claude.result.subtype': 'success',
+                    'claude.result.text': '4',
+                    'claude.model_usage': {
+                        'claude-sonnet-4-6': {
+                            'inputTokens': 3,
+                            'outputTokens': 5,
+                            'cacheReadInputTokens': 7166,
+                            'cacheCreationInputTokens': 2175,
+                            'webSearchRequests': 0,
+                            'costUSD': 0.01039005,
+                            'contextWindow': 200000,
+                            'maxOutputTokens': 32000,
+                        }
+                    },
+                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
                     'logfire.json_schema': {
@@ -1215,6 +1342,11 @@ async def test_server_tool_blocks_cassette(
                             'gen_ai.conversation.id': {},
                             'num_turns': {},
                             'duration_ms': {},
+                            'duration_api_ms': {},
+                            'claude.result.subtype': {},
+                            'claude.result.text': {},
+                            'claude.model_usage': {'type': 'object'},
+                            'gen_ai.response.finish_reasons': {'type': 'array'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
                         },
@@ -1397,6 +1529,22 @@ async def test_ratelimit_and_mirror_error_cassette(
                     'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
                     'num_turns': 1,
                     'duration_ms': 2263,
+                    'duration_api_ms': 2257,
+                    'claude.result.subtype': 'success',
+                    'claude.result.text': '4',
+                    'claude.model_usage': {
+                        'claude-sonnet-4-6': {
+                            'inputTokens': 3,
+                            'outputTokens': 5,
+                            'cacheReadInputTokens': 7166,
+                            'cacheCreationInputTokens': 2175,
+                            'webSearchRequests': 0,
+                            'costUSD': 0.01039005,
+                            'contextWindow': 200000,
+                            'maxOutputTokens': 32000,
+                        }
+                    },
+                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
                     'logfire.json_schema': {
@@ -1415,6 +1563,11 @@ async def test_ratelimit_and_mirror_error_cassette(
                             'gen_ai.conversation.id': {},
                             'num_turns': {},
                             'duration_ms': {},
+                            'duration_api_ms': {},
+                            'claude.result.subtype': {},
+                            'claude.result.text': {},
+                            'claude.model_usage': {'type': 'object'},
+                            'gen_ai.response.finish_reasons': {'type': 'array'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
                         },

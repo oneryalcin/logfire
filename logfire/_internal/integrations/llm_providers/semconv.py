@@ -102,6 +102,22 @@ RATE_LIMIT_OVERAGE_RESETS_AT = 'gen_ai.rate_limit.overage.resets_at'
 RATE_LIMIT_OVERAGE_DISABLED_REASON = 'gen_ai.rate_limit.overage.disabled_reason'
 RATE_LIMIT_RAW = 'gen_ai.rate_limit.raw'
 
+# Claude Agent SDK result-message fields (vendor-prefixed extensions; not in
+# upstream OTel gen-ai semconv). Surfaced from ResultMessage which summarises
+# the end-of-conversation state. The `text`, `errors`, `structured_output`,
+# `subtype`, and `model_usage` keys are added to the scrubber's SAFE_KEYS
+# allowlist — they carry model-generated content or deterministic enums/
+# numbers, where default regex-based scrubbing does more harm than good.
+# `permission_denials` is deliberately NOT on the allowlist: denial entries
+# include the caller-supplied ``tool_input`` which is genuinely arbitrary
+# user data where scrubbing is the safer default.
+CLAUDE_RESULT_SUBTYPE = 'claude.result.subtype'
+CLAUDE_RESULT_TEXT = 'claude.result.text'
+CLAUDE_RESULT_ERRORS = 'claude.result.errors'
+CLAUDE_RESULT_STRUCTURED_OUTPUT = 'claude.result.structured_output'
+CLAUDE_MODEL_USAGE = 'claude.model_usage'
+CLAUDE_PERMISSION_DENIALS = 'claude.permission_denials'
+
 # Type definitions for message parts and messages
 
 

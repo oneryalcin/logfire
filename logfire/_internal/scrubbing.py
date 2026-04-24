@@ -167,6 +167,16 @@ class BaseScrubber(ABC):
         gen_ai_semconv.PROVIDER_NAME,
         gen_ai_semconv.REQUEST_MODEL,
         gen_ai_semconv.RESPONSE_MODEL,
+        # Claude Agent SDK ResultMessage fields carrying model-generated content
+        # or deterministic enums/numbers. See semconv.py for the rationale for
+        # each; ``claude.permission_denials`` is deliberately omitted (its
+        # entries carry user-supplied ``tool_input`` where scrubbing is the
+        # safer default).
+        gen_ai_semconv.CLAUDE_RESULT_TEXT,
+        gen_ai_semconv.CLAUDE_RESULT_ERRORS,
+        gen_ai_semconv.CLAUDE_RESULT_STRUCTURED_OUTPUT,
+        gen_ai_semconv.CLAUDE_RESULT_SUBTYPE,
+        gen_ai_semconv.CLAUDE_MODEL_USAGE,
     }
 
     @abstractmethod
