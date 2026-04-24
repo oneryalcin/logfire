@@ -435,6 +435,98 @@ async def test_close_skips_pydantic_ai_all_messages_when_history_empty(exporter:
     assert 'pydantic_ai.all_messages' not in root_attrs
 
 
+@pytest.mark.anyio
+async def test_handle_assistant_message_populates_per_turn_identifiers(exporter: TestExporter) -> None:
+    """All four per-turn identifiers land on the chat span when the
+    ``AssistantMessage`` carries them: ``gen_ai.response.id`` (Anthropic
+    message id), ``gen_ai.response.finish_reasons`` (per-turn stop reason),
+    ``claude.message.uuid`` (SDK stream id), ``claude.parent_tool_use_id``
+    (subagent stitching)."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[_user_msg('q')])
+        state.open_chat_span()
+        state.handle_assistant_message(
+            AssistantMessage(
+                content=[TextBlock(text='done')],
+                model='claude-sonnet-4-6',
+                message_id='msg_01ABC',
+                stop_reason='end_turn',
+                uuid='00000000-0000-0000-0000-000000000001',
+                parent_tool_use_id='toolu_01PARENT',
+            )
+        )
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    chat = next(s for s in spans if s['name'].startswith('chat'))
+    assert chat['attributes']['gen_ai.response.id'] == 'msg_01ABC'
+    assert chat['attributes']['gen_ai.response.finish_reasons'] == ['end_turn']
+    assert chat['attributes']['claude.message.uuid'] == '00000000-0000-0000-0000-000000000001'
+    assert chat['attributes']['claude.parent_tool_use_id'] == 'toolu_01PARENT'
+
+
+@pytest.mark.anyio
+async def test_handle_assistant_message_skips_missing_identifiers(exporter: TestExporter) -> None:
+    """An ``AssistantMessage`` with default (None) optional fields should
+    produce no per-turn identifier attributes — avoids emitting noise on
+    spans that carry only text content."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[_user_msg('q')])
+        state.open_chat_span()
+        state.handle_assistant_message(AssistantMessage(content=[TextBlock(text='done')], model='claude-sonnet-4-6'))
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    chat = next(s for s in spans if s['name'].startswith('chat'))
+    for absent in (
+        'gen_ai.response.id',
+        'gen_ai.response.finish_reasons',
+        'claude.message.uuid',
+        'claude.parent_tool_use_id',
+    ):
+        assert absent not in chat['attributes'], f'{absent!r} should be skipped when None'
+
+
+@pytest.mark.anyio
+async def test_handle_assistant_message_last_write_wins_across_sub_messages(exporter: TestExporter) -> None:
+    """Multiple ``AssistantMessage``s on the same chat span → per-turn
+    identifiers are last-write-wins (the final ``message_id`` /
+    ``stop_reason`` is authoritative for the turn, matching the accumulating
+    behaviour of ``OUTPUT_MESSAGES``).
+
+    Locked as a test so a refactor to first-write-wins or list-appending
+    is an explicit breaking change, not a silent one.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[_user_msg('q')])
+        state.open_chat_span()
+        state.handle_assistant_message(
+            AssistantMessage(
+                content=[TextBlock(text='thinking...')],
+                model='claude-sonnet-4-6',
+                message_id='msg_01FIRST',
+                stop_reason='tool_use',
+            )
+        )
+        state.handle_assistant_message(
+            AssistantMessage(
+                content=[TextBlock(text='done')],
+                model='claude-sonnet-4-6',
+                message_id='msg_01LAST',
+                stop_reason='end_turn',
+            )
+        )
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    chat = next(s for s in spans if s['name'].startswith('chat'))
+    assert chat['attributes']['gen_ai.response.id'] == 'msg_01LAST'
+    assert chat['attributes']['gen_ai.response.finish_reasons'] == ['end_turn']
+
+
 def test_server_tool_result_persists_under_assistant_role_in_history() -> None:
     """Server-tool ``tool_call_response`` parts stay under ``role='assistant'``
     in conversation history, not promoted to ``role='tool'``.
@@ -893,8 +985,12 @@ async def test_basic_conversation_cassette(
                             'gen_ai.usage.partial.output_tokens': {},
                             'gen_ai.usage.partial.cache_read.input_tokens': {},
                             'gen_ai.usage.partial.cache_creation.input_tokens': {},
+                            'gen_ai.response.id': {},
+                            'claude.message.uuid': {},
                         },
                     },
+                    'gen_ai.response.id': 'msg_01BxK8UH2LyuFLVXSPamqHam',
+                    'claude.message.uuid': 'ce1101bc-27c6-41b1-ae16-5edf06b0927c',
                     'logfire.span_type': 'span',
                 },
             },
@@ -1394,6 +1490,8 @@ async def test_server_tool_blocks_cassette(
                     'gen_ai.usage.partial.output_tokens': 1,
                     'gen_ai.usage.partial.cache_read.input_tokens': 7166,
                     'gen_ai.usage.partial.cache_creation.input_tokens': 2175,
+                    'gen_ai.response.id': 'msg_01SrvToolFixturePpppppppppp',
+                    'claude.message.uuid': 'f85bae42-7165-4a5e-991b-68c4fd586f8a',
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
@@ -1409,6 +1507,8 @@ async def test_server_tool_blocks_cassette(
                             'gen_ai.usage.partial.output_tokens': {},
                             'gen_ai.usage.partial.cache_read.input_tokens': {},
                             'gen_ai.usage.partial.cache_creation.input_tokens': {},
+                            'gen_ai.response.id': {},
+                            'claude.message.uuid': {},
                         },
                     },
                 },
@@ -1641,6 +1741,8 @@ async def test_ratelimit_and_mirror_error_cassette(
                     'gen_ai.usage.partial.output_tokens': 1,
                     'gen_ai.usage.partial.cache_read.input_tokens': 7166,
                     'gen_ai.usage.partial.cache_creation.input_tokens': 2175,
+                    'gen_ai.response.id': 'msg_01BxK8UH2LyuFLVXSPamqHam',
+                    'claude.message.uuid': 'ce1101bc-27c6-41b1-ae16-5edf06b0927c',
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
@@ -1656,6 +1758,8 @@ async def test_ratelimit_and_mirror_error_cassette(
                             'gen_ai.usage.partial.output_tokens': {},
                             'gen_ai.usage.partial.cache_read.input_tokens': {},
                             'gen_ai.usage.partial.cache_creation.input_tokens': {},
+                            'gen_ai.response.id': {},
+                            'claude.message.uuid': {},
                         },
                     },
                 },
