@@ -77,6 +77,9 @@ USAGE_RAW = 'gen_ai.usage.raw'
 INPUT_MESSAGES = 'gen_ai.input.messages'
 OUTPUT_MESSAGES = 'gen_ai.output.messages'
 SYSTEM_INSTRUCTIONS = 'gen_ai.system_instructions'
+# Full conversation history on the agent root span. Logfire's Model Run UI
+# renders this specific attribute as the root-span chat view.
+PYDANTIC_AI_ALL_MESSAGES = 'pydantic_ai.all_messages'
 
 # Tool execution
 TOOL_DEFINITIONS = 'gen_ai.tool.definitions'
@@ -87,6 +90,17 @@ TOOL_CALL_RESULT = 'gen_ai.tool.call.result'
 
 # Conversation tracking
 CONVERSATION_ID = 'gen_ai.conversation.id'
+
+# OTel GenAI semconv attribute identifying the agent framework.
+AGENT_NAME = 'gen_ai.agent.name'
+
+# Working directory the Claude Agent SDK is running in. Intentionally under
+# the vendor-prefixed ``claude.*`` namespace (rather than the ``session.*``
+# convention used by some Claude-Code-family plugins) so value-level scrubbing
+# still runs against the path — cwd strings legitimately contain substrings
+# like ``auth``, ``secret``, ``private_keys``, etc., and regex scrubbing there
+# is the safer default.
+CLAUDE_CWD = 'claude.cwd'
 
 # Error
 ERROR_TYPE = 'error.type'
@@ -117,6 +131,9 @@ CLAUDE_RESULT_ERRORS = 'claude.result.errors'
 CLAUDE_RESULT_STRUCTURED_OUTPUT = 'claude.result.structured_output'
 CLAUDE_MODEL_USAGE = 'claude.model_usage'
 CLAUDE_PERMISSION_DENIALS = 'claude.permission_denials'
+# Aggregated tool usage across the conversation, emitted on the
+# ``invoke_agent`` root span at close for dashboards that group by tool.
+CLAUDE_TOOLS_USED = 'claude.tools_used'
 
 # Type definitions for message parts and messages
 
