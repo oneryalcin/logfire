@@ -51,12 +51,22 @@ from logfire._internal.integrations.claude_agent_sdk import (
     _inject_tracing_hooks,
     _options_attrs,
     _record_mirror_error,
+    _record_notification,
+    _record_permission_request,
+    _record_pre_compact,
     _record_rate_limit_event,
     _record_result,
+    _record_stop,
+    _record_user_prompt_submit,
     _set_state,
+    notification_hook,
+    permission_request_hook,
     post_tool_use_failure_hook,
     post_tool_use_hook,
+    pre_compact_hook,
     pre_tool_use_hook,
+    stop_hook,
+    user_prompt_submit_hook,
 )
 from logfire.testing import TestExporter
 
@@ -985,11 +995,30 @@ def test_inject_hooks_no_hooks_attr() -> None:
 
 
 def test_inject_hooks_none_hooks() -> None:
+    """All 8 hook events register a callback when injection runs.
+
+    Locks the full coverage contract: tool-lifecycle (PreToolUse / PostToolUse
+    / PostToolUseFailure) plus the 5 non-tool-lifecycle hooks added in #9
+    (UserPromptSubmit / Stop / PreCompact / Notification / PermissionRequest).
+    A regression that drops one event silently kills observability for that
+    event class — the test is the gate.
+    """
     options = ClaudeAgentOptions(hooks=None)
     _inject_tracing_hooks(options)
     assert options.hooks is not None
-    assert 'PreToolUse' in options.hooks
-    assert len(options.hooks['PreToolUse']) == 1
+    expected_events = {
+        'PreToolUse',
+        'PostToolUse',
+        'PostToolUseFailure',
+        'UserPromptSubmit',
+        'Stop',
+        'PreCompact',
+        'Notification',
+        'PermissionRequest',
+    }
+    assert set(options.hooks) == expected_events
+    for event in expected_events:
+        assert len(options.hooks[event]) == 1, f'event {event!r} should have exactly one matcher'
 
 
 def test_inject_hooks_with_existing_events() -> None:
@@ -1005,8 +1034,302 @@ def test_inject_hooks_with_existing_events() -> None:
     options = Opts()
     _inject_tracing_hooks(options)
     assert options.hooks is not None
+    # Existing user-supplied matcher is preserved AFTER our injected one
+    # (we ``insert(0, ...)`` so our hook runs first).
     assert len(options.hooks['PreToolUse']) == 2
     assert options.hooks['PreToolUse'][1] is existing_hook
+    # New non-tool-lifecycle events are added too, even though Opts didn't
+    # declare them.
+    for event in ('UserPromptSubmit', 'Stop', 'PreCompact', 'Notification', 'PermissionRequest'):
+        assert event in options.hooks
+        assert len(options.hooks[event]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Hook-event helper tests (issue #9). Each helper is a small unit that runs
+# under an open ``invoke_agent`` span; we drive it directly with synthetic
+# input dicts rather than going through the SDK's hook-dispatch machinery.
+# Three of the five hooks (PreCompact / Notification / PermissionRequest)
+# don't fire under non-interactive SDK transport — these unit tests are the
+# only coverage they get, so the assertions are intentionally specific
+# (level, attribute names, scrubber-relevance, counter behavior).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_record_user_prompt_submit_emits_log_with_prompt_attr(exporter: TestExporter) -> None:
+    """``_record_user_prompt_submit`` emits an info log under the active
+    invoke_agent with ``claude.user_prompt`` carrying the submitted text and
+    increments the per-conversation counter.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_user_prompt_submit(state, {'session_id': 's1', 'prompt': 'hello world'})
+    assert state.user_prompt_count == 1
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Hook: UserPromptSubmit')
+    assert log['attributes']['claude.user_prompt'] == 'hello world'
+    assert log['attributes']['gen_ai.conversation.id'] == 's1'
+    assert log['attributes']['logfire.level_num'] == 9  # info
+
+
+@pytest.mark.anyio
+async def test_record_user_prompt_submit_skips_when_prompt_absent(exporter: TestExporter) -> None:
+    """A defensive run with no ``prompt`` field still increments the counter
+    and emits the log (audit value: every hook fires, even malformed ones)
+    but skips the ``claude.user_prompt`` attribute."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_user_prompt_submit(state, {'session_id': 's1'})
+    assert state.user_prompt_count == 1
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Hook: UserPromptSubmit')
+    assert 'claude.user_prompt' not in log['attributes']
+
+
+@pytest.mark.anyio
+async def test_record_stop_captures_undeclared_last_assistant_message(exporter: TestExporter) -> None:
+    """``last_assistant_message`` is on the wire but absent from the SDK's
+    ``StopHookInput`` type. Capturing it via ``.get()`` is the forward-compat
+    contract: present today → land it; absent tomorrow → silently skip.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_stop(
+            state,
+            {'session_id': 's1', 'stop_hook_active': False, 'last_assistant_message': 'final text'},
+        )
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Hook: Stop')
+    assert log['attributes']['claude.stop.last_assistant_message'] == 'final text'
+    # ``stop_hook_active=False`` is the common case — skip it to keep
+    # happy-path logs noise-free.
+    assert 'claude.stop.hook_active' not in log['attributes']
+
+
+@pytest.mark.anyio
+async def test_record_stop_emits_hook_active_only_when_true(exporter: TestExporter) -> None:
+    """Locks the "emit only when True" semantic for ``stop_hook_active``.
+
+    If the SDK ever flips this to default-True the logs would otherwise be
+    drowned in always-True attrs; the test is the canary.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_stop(state, {'session_id': 's1', 'stop_hook_active': True})
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Hook: Stop')
+    assert log['attributes']['claude.stop.hook_active'] is True
+
+
+@pytest.mark.anyio
+async def test_record_pre_compact_emits_warn_log_with_trigger(exporter: TestExporter) -> None:
+    """PreCompact is warn-level (context-pressure signal) and increments
+    ``compact_count``. Captures both ``trigger`` and ``custom_instructions``.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_pre_compact(
+            state,
+            {'session_id': 's1', 'trigger': 'auto', 'custom_instructions': 'preserve API tokens section'},
+        )
+    assert state.compact_count == 1
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'].startswith('Hook: PreCompact'))
+    assert log['attributes']['claude.compact.trigger'] == 'auto'
+    assert log['attributes']['claude.compact.custom_instructions'] == 'preserve API tokens section'
+    assert log['attributes']['logfire.level_num'] == 13  # warn
+
+
+@pytest.mark.anyio
+async def test_record_pre_compact_skips_none_custom_instructions(exporter: TestExporter) -> None:
+    """``custom_instructions`` is ``str | None`` per the SDK type — None → skip."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_pre_compact(
+            state,
+            {'session_id': 's1', 'trigger': 'manual', 'custom_instructions': None},
+        )
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'].startswith('Hook: PreCompact'))
+    assert 'claude.compact.custom_instructions' not in log['attributes']
+    assert log['attributes']['claude.compact.trigger'] == 'manual'
+
+
+@pytest.mark.anyio
+async def test_record_notification_captures_message_title_type(exporter: TestExporter) -> None:
+    """Notification hook surfaces all 3 SDK fields plus the per-conversation counter."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_notification(
+            state,
+            {
+                'session_id': 's1',
+                'message': 'Permission needed',
+                'title': 'Claude Code',
+                'notification_type': 'permission_request',
+            },
+        )
+    assert state.notification_count == 1
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'].startswith('Hook: Notification'))
+    assert log['attributes']['claude.notification.message'] == 'Permission needed'
+    assert log['attributes']['claude.notification.title'] == 'Claude Code'
+    assert log['attributes']['claude.notification.type'] == 'permission_request'
+
+
+@pytest.mark.anyio
+async def test_record_permission_request_captures_subagent_attribution(exporter: TestExporter) -> None:
+    """PermissionRequest fired from inside a subagent context — capture
+    ``agent_id`` / ``agent_type`` opportunistically (groundwork for #3).
+    Also locks ``tool_input`` capture under the audit attr.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_permission_request(
+            state,
+            {
+                'session_id': 's1',
+                'tool_name': 'Bash',
+                'tool_input': {'command': 'rm -rf tmp/'},
+                'permission_suggestions': [{'allow': True}],
+                'agent_id': 'subagent-7',
+                'agent_type': 'general-purpose',
+            },
+        )
+    assert state.permission_request_count == 1
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'].startswith('Hook: PermissionRequest'))
+    assert log['attributes']['gen_ai.tool.name'] == 'Bash'
+    assert log['attributes']['claude.permission_request.tool_input'] == {'command': 'rm -rf tmp/'}
+    assert log['attributes']['claude.permission_request.suggestions'] == [{'allow': True}]
+    assert log['attributes']['claude.agent_id'] == 'subagent-7'
+    assert log['attributes']['claude.agent_type'] == 'general-purpose'
+
+
+@pytest.mark.anyio
+async def test_record_permission_request_skips_subagent_attribution_when_absent(exporter: TestExporter) -> None:
+    """Main-thread PermissionRequest (no subagent context) → no agent.* attrs."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_permission_request(
+            state,
+            {'session_id': 's1', 'tool_name': 'Read', 'tool_input': {'path': '/tmp/foo'}},
+        )
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'].startswith('Hook: PermissionRequest'))
+    for absent in ('claude.agent_id', 'claude.agent_type', 'claude.permission_request.suggestions'):
+        assert absent not in log['attributes'], f'{absent!r} should be skipped when not in input'
+
+
+@pytest.mark.anyio
+async def test_close_emits_hook_event_counters_when_nonzero(exporter: TestExporter) -> None:
+    """Counters land on the ``invoke_agent`` root span at ``close()`` —
+    matches the ``claude.tools_used`` precedent. Regressions that fail to
+    set them on the root would silently break dashboard aggregation.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        # Fire each helper so all four counters increment.
+        _record_user_prompt_submit(state, {'session_id': 's1', 'prompt': 'p'})
+        _record_pre_compact(state, {'session_id': 's1', 'trigger': 'auto', 'custom_instructions': None})
+        _record_notification(state, {'session_id': 's1', 'message': 'm', 'notification_type': 'idle'})
+        _record_permission_request(state, {'session_id': 's1', 'tool_name': 'Bash', 'tool_input': {}})
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    assert root_attrs['claude.user_prompt_count'] == 1
+    assert root_attrs['claude.compact_count'] == 1
+    assert root_attrs['claude.notification_count'] == 1
+    assert root_attrs['claude.permission_request_count'] == 1
+
+
+@pytest.mark.anyio
+async def test_close_skips_zero_hook_event_counters(exporter: TestExporter) -> None:
+    """Sessions where no hook events fired don't carry zero-valued counter
+    attributes — keeps happy-path spans noise-free.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    for absent in (
+        'claude.user_prompt_count',
+        'claude.compact_count',
+        'claude.notification_count',
+        'claude.permission_request_count',
+    ):
+        assert absent not in root_attrs
+
+
+@pytest.mark.anyio
+async def test_hook_callbacks_no_state_returns_empty() -> None:
+    """All five new hook callbacks bail out gracefully when there is no
+    active ``_ConversationState`` — covers the case where a hook fires
+    outside an instrumented ``receive_response`` block (e.g. SDK initialised
+    but no query in flight).
+    """
+    ctx: HookContext = {'signal': None}
+    _clear_state()
+    for callback in (
+        user_prompt_submit_hook,
+        stop_hook,
+        pre_compact_hook,
+        notification_hook,
+        permission_request_hook,
+    ):
+        assert await callback({'session_id': 's1'}, 'tu_1', ctx) == {}
+
+
+@pytest.mark.anyio
+async def test_hook_callbacks_attach_to_root_span_context(exporter: TestExporter) -> None:
+    """A hook callback fires in a different anyio task → contextvars don't
+    propagate. Each callback explicitly attaches the root span as the active
+    OTel context before emitting, so the resulting log lands as a CHILD of
+    ``invoke_agent``, not as an orphan top-level span.
+
+    Locks the integration's most subtle invariant — a regression that drops
+    the attach/detach dance produces orphan spans that silently break
+    dashboards keyed on root-span filtering.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    ctx: HookContext = {'signal': None}
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            await user_prompt_submit_hook({'session_id': 's1', 'prompt': 'hi'}, 'tu_1', ctx)
+            await stop_hook({'session_id': 's1', 'stop_hook_active': False}, 'tu_2', ctx)
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_span = next(s for s in spans if s['name'] == 'invoke_agent')
+    root_id = root_span['context']['span_id']
+    for log_name in ('Hook: UserPromptSubmit', 'Hook: Stop'):
+        log = next(s for s in spans if s['name'] == log_name)
+        assert log['parent']['span_id'] == root_id, f'{log_name} should be parented to invoke_agent'
 
 
 @pytest.mark.anyio

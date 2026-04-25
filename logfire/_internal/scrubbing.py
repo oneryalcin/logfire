@@ -178,6 +178,12 @@ class BaseScrubber(ABC):
         gen_ai_semconv.CLAUDE_RESULT_SUBTYPE,
         gen_ai_semconv.CLAUDE_MODEL_USAGE,
         gen_ai_semconv.CLAUDE_TOOLS_USED,
+        # Hook-event content (issue #9). Operator-set or model-generated
+        # text that default regex scrubbing would over-redact. See semconv.py
+        # for the rationale; ``claude.user_prompt`` and
+        # ``claude.notification.*`` are deliberately *not* on this list.
+        gen_ai_semconv.CLAUDE_COMPACT_INSTRUCTIONS,
+        gen_ai_semconv.CLAUDE_STOP_LAST_ASSISTANT_MESSAGE,
     }
 
     @abstractmethod
