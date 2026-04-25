@@ -141,6 +141,36 @@ CLAUDE_TOOLS_USED = 'claude.tools_used'
 CLAUDE_MESSAGE_UUID = 'claude.message.uuid'
 CLAUDE_PARENT_TOOL_USE_ID = 'claude.parent_tool_use_id'
 
+# ClaudeAgentOptions-derived attributes surfaced on the ``invoke_agent``
+# root span when the caller configured them. Names avoid the ``session``
+# substring (which would trip the default scrubber): ``resume`` →
+# ``resume_from``, ``fork_session`` → ``fork_on_resume``.
+# ``model`` and ``fallback_model`` carry the deeper ``.options.`` prefix to
+# disambiguate from per-turn ``gen_ai.request.model`` on chat spans. Other
+# options-derived attrs below are bare ``claude.<field>`` because they have
+# no collision in the existing namespace.
+CLAUDE_OPTIONS_MODEL = 'claude.options.model'
+CLAUDE_OPTIONS_FALLBACK_MODEL = 'claude.options.fallback_model'
+CLAUDE_PERMISSION_MODE = 'claude.permission_mode'
+CLAUDE_MAX_TURNS = 'claude.max_turns'
+CLAUDE_MAX_BUDGET_USD = 'claude.max_budget_usd'
+CLAUDE_ALLOWED_TOOLS = 'claude.allowed_tools'
+CLAUDE_DISALLOWED_TOOLS = 'claude.disallowed_tools'
+CLAUDE_EFFORT = 'claude.effort'
+CLAUDE_AGENTS = 'claude.agents'
+# ``skills`` on ClaudeAgentOptions is ``list[str] | Literal["all"] | None``.
+# We split the mixed shape into a discriminator + list so downstream
+# typed stores see one schema: ``claude.skills_mode`` is "all" or
+# "allowlist"; ``claude.skills`` is the list (omitted in "all" mode).
+CLAUDE_SKILLS_MODE = 'claude.skills_mode'
+CLAUDE_SKILLS = 'claude.skills'
+CLAUDE_SETTING_SOURCES = 'claude.setting_sources'
+CLAUDE_CONTINUE_CONVERSATION = 'claude.continue_conversation'
+CLAUDE_INCLUDE_PARTIAL_MESSAGES = 'claude.include_partial_messages'
+CLAUDE_ENABLE_FILE_CHECKPOINTING = 'claude.enable_file_checkpointing'
+CLAUDE_RESUME_FROM = 'claude.resume_from'
+CLAUDE_FORK_ON_RESUME = 'claude.fork_on_resume'
+
 # Type definitions for message parts and messages
 
 
