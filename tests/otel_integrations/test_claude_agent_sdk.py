@@ -49,6 +49,7 @@ from logfire._internal.integrations.claude_agent_sdk import (
     _ConversationState,
     _extract_usage,
     _inject_tracing_hooks,
+    _options_attrs,
     _record_mirror_error,
     _record_rate_limit_event,
     _record_result,
@@ -525,6 +526,110 @@ async def test_handle_assistant_message_last_write_wins_across_sub_messages(expo
     chat = next(s for s in spans if s['name'].startswith('chat'))
     assert chat['attributes']['gen_ai.response.id'] == 'msg_01LAST'
     assert chat['attributes']['gen_ai.response.finish_reasons'] == ['end_turn']
+
+
+def test_options_attrs_full() -> None:
+    """``_options_attrs`` surfaces every observability-relevant field on the
+    invoke_agent root span when the caller populated it."""
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    opts = ClaudeAgentOptions(
+        model='claude-sonnet-4-6',
+        fallback_model='claude-haiku-4-5',
+        permission_mode='acceptEdits',
+        max_turns=5,
+        max_budget_usd=0.5,
+        allowed_tools=['Bash', 'Read'],
+        disallowed_tools=['WebFetch'],
+        effort='medium',
+        resume='prev-session-uuid',
+        skills=['skill_a', 'skill_b'],
+        setting_sources=['project'],
+        continue_conversation=True,
+        include_partial_messages=True,
+        enable_file_checkpointing=True,
+        fork_session=True,
+        agents={'reviewer': object(), 'planner': object()},  # type: ignore[dict-item]
+    )
+    attrs = _options_attrs(opts)
+    assert attrs == {
+        'claude.options.model': 'claude-sonnet-4-6',
+        'claude.options.fallback_model': 'claude-haiku-4-5',
+        'claude.permission_mode': 'acceptEdits',
+        'claude.max_turns': 5,
+        'claude.max_budget_usd': 0.5,
+        'claude.effort': 'medium',
+        'claude.resume_from': 'prev-session-uuid',
+        'claude.skills_mode': 'allowlist',
+        'claude.skills': ['skill_a', 'skill_b'],
+        'claude.allowed_tools': ['Bash', 'Read'],
+        'claude.disallowed_tools': ['WebFetch'],
+        'claude.setting_sources': ['project'],
+        'claude.continue_conversation': True,
+        'claude.include_partial_messages': True,
+        'claude.enable_file_checkpointing': True,
+        'claude.fork_on_resume': True,
+        'claude.agents': ['planner', 'reviewer'],
+    }
+
+
+def test_options_attrs_defaults_emit_nothing() -> None:
+    """A default-constructed ``ClaudeAgentOptions()`` yields no extra
+    attributes — keeps happy-path spans free of always-empty noise."""
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    assert _options_attrs(ClaudeAgentOptions()) == {}
+
+
+def test_options_attrs_renames_session_substrings() -> None:
+    """``resume`` and ``fork_session`` are surfaced under renamed attribute
+    keys (``claude.resume_from`` / ``claude.fork_on_resume``) because the
+    original names contain the ``session`` substring that triggers the
+    default scrubber on attribute names. Locked as a test so a refactor
+    that "fixes" the names back to the SDK field names regresses scrubbing.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    opts = ClaudeAgentOptions(resume='r', fork_session=True)
+    attrs = _options_attrs(opts)
+    assert 'claude.resume_from' in attrs
+    assert 'claude.fork_on_resume' in attrs
+    assert not any('session' in k for k in attrs)
+
+
+def test_options_attrs_skills_all_normalises_to_mode_only() -> None:
+    """``skills='all'`` emits ``claude.skills_mode='all'`` and NO
+    ``claude.skills`` list — keeps the attribute schema stable as a list
+    type for downstream typed stores."""
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    attrs = _options_attrs(ClaudeAgentOptions(skills='all'))
+    assert attrs == {'claude.skills_mode': 'all'}
+
+
+def test_options_attrs_rejects_non_options_object() -> None:
+    """Defensive isinstance — duck-typed mocks emit nothing rather than
+    silently shipping garbage attribute values."""
+    from types import SimpleNamespace
+
+    fake = SimpleNamespace(
+        model=123,                       # wrong type
+        permission_mode=['nonsense'],    # wrong type
+        max_turns='five',                # wrong type
+    )
+    assert _options_attrs(fake) == {}
+
+
+def test_options_attrs_skips_non_dict_agents() -> None:
+    """``agents`` is typed ``dict[str, AgentDefinition] | None``. If a
+    future SDK change makes it a list, our extractor must skip rather
+    than emit ``[<AgentDefinition repr…>, …]``."""
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    opts = ClaudeAgentOptions()
+    object.__setattr__(opts, 'agents', ['reviewer', 'planner'])  # simulate shape drift
+    attrs = _options_attrs(opts)
+    assert 'claude.agents' not in attrs
 
 
 def test_server_tool_result_persists_under_assistant_role_in_history() -> None:

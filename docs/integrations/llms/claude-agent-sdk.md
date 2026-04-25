@@ -116,6 +116,18 @@ The `invoke_agent` root span is finalised with the full conversation and aggrega
 - `gen_ai.agent.name` — the agent framework identifier (currently fixed to `claude-code`).
 - `claude.cwd` — the working directory from `ClaudeAgentOptions.cwd`, when set. Intentionally under the `claude.*` namespace rather than `session.*` so value-level scrubbing (e.g. paths containing `secret` / `private_key` / `auth`) still applies.
 
+### Session configuration
+
+When the corresponding `ClaudeAgentOptions` field is set, the following attributes also appear on the `invoke_agent` root span. They're useful for filtering / grouping sessions in dashboards by configuration.
+
+- `claude.options.model` / `claude.options.fallback_model` — the model originally requested (distinct from `gen_ai.request.model` on the `chat` span which reflects the *actually used* model).
+- `claude.permission_mode`, `claude.max_turns`, `claude.max_budget_usd`, `claude.effort`.
+- `claude.allowed_tools`, `claude.disallowed_tools`, `claude.setting_sources`, `claude.agents` (custom-agent names only — `AgentDefinition` bodies are deliberately not serialised).
+- `claude.skills_mode` (`"all"` | `"allowlist"`) plus `claude.skills` (the list, in allowlist mode). The mixed `Literal["all"] | list[str]` SDK shape is normalised to a stable list type plus a discriminator so column-typed downstream stores see one schema.
+- `claude.continue_conversation`, `claude.include_partial_messages`, `claude.enable_file_checkpointing` — booleans, emitted only when `True` to keep happy-path spans noise-free.
+- `claude.resume_from` (from `ClaudeAgentOptions.resume`) and `claude.fork_on_resume` (from `fork_session`). Both renamed to drop the `session` substring that would otherwise trip the default scrubber's attribute-name match.
+- `ClaudeAgentOptions.user` is intentionally **not** surfaced. Although the SDK forces it to be a real Unix username, it remains host-level identity that users may legitimately want to keep out of every span. Operators who want it can record it themselves outside this integration.
+
 ## Per-turn chat span attributes
 
 Each `chat` child span carries per-turn identifiers derived from the `AssistantMessage` that closed the turn:

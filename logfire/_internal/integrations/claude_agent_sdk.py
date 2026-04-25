@@ -32,15 +32,32 @@ from opentelemetry import context as context_api, trace as trace_api
 
 from logfire._internal.integrations.llm_providers.semconv import (
     AGENT_NAME,
+    CLAUDE_AGENTS,
+    CLAUDE_ALLOWED_TOOLS,
+    CLAUDE_CONTINUE_CONVERSATION,
     CLAUDE_CWD,
+    CLAUDE_DISALLOWED_TOOLS,
+    CLAUDE_EFFORT,
+    CLAUDE_ENABLE_FILE_CHECKPOINTING,
+    CLAUDE_FORK_ON_RESUME,
+    CLAUDE_INCLUDE_PARTIAL_MESSAGES,
+    CLAUDE_MAX_BUDGET_USD,
+    CLAUDE_MAX_TURNS,
     CLAUDE_MESSAGE_UUID,
     CLAUDE_MODEL_USAGE,
+    CLAUDE_OPTIONS_FALLBACK_MODEL,
+    CLAUDE_OPTIONS_MODEL,
     CLAUDE_PARENT_TOOL_USE_ID,
     CLAUDE_PERMISSION_DENIALS,
+    CLAUDE_PERMISSION_MODE,
     CLAUDE_RESULT_ERRORS,
     CLAUDE_RESULT_STRUCTURED_OUTPUT,
     CLAUDE_RESULT_SUBTYPE,
     CLAUDE_RESULT_TEXT,
+    CLAUDE_RESUME_FROM,
+    CLAUDE_SETTING_SOURCES,
+    CLAUDE_SKILLS,
+    CLAUDE_SKILLS_MODE,
     CLAUDE_TOOLS_USED,
     CONVERSATION_ID,
     ERROR_TYPE,
@@ -201,6 +218,90 @@ def _extract_usage(usage: Any, *, partial: bool = False) -> dict[str, int]:
         result[f'{prefix}cache_creation.input_tokens'] = cache_creation
 
     return result
+
+
+def _options_attrs(options: Any) -> dict[str, Any]:
+    """Extract observability-relevant fields from ``ClaudeAgentOptions``.
+
+    Only fields that help dashboards / audits / debugging are surfaced.
+    Omits infrastructure-only fields (``cli_path``, ``env``, ``stderr``,
+    ``hooks``, ``session_store``, ``plugins``, ``sandbox``,
+    ``load_timeout_ms``), callables, and potentially-large configs
+    (``mcp_servers``, ``extra_args``, ``output_format`` schemas,
+    ``thinking`` / ``task_budget`` dicts).
+
+    Also intentionally omits ``user``: although the SDK calls ``getpwnam``
+    on it (forcing a real Unix username), it's host-level identity that
+    operators may legitimately want to keep out of every span. Operators
+    who want it can capture ``user`` themselves outside this integration.
+
+    ``resume`` and ``fork_session`` are surfaced under renamed keys
+    (``claude.resume_from`` / ``claude.fork_on_resume``) because the
+    original names contain the ``session`` substring which would trigger
+    the default logfire scrubber on the attribute name.
+    """
+    # Defensive isinstance — duck-typed mocks could otherwise silently
+    # emit garbage as attribute values (e.g. ``model=123`` ints).
+    if not isinstance(options, claude_agent_sdk.ClaudeAgentOptions):
+        return {}
+
+    attrs: dict[str, Any] = {}
+
+    # Scalars — emit when not None.
+    scalar_map: tuple[tuple[str, str], ...] = (
+        ('model', CLAUDE_OPTIONS_MODEL),
+        ('fallback_model', CLAUDE_OPTIONS_FALLBACK_MODEL),
+        ('permission_mode', CLAUDE_PERMISSION_MODE),
+        ('max_turns', CLAUDE_MAX_TURNS),
+        ('max_budget_usd', CLAUDE_MAX_BUDGET_USD),
+        ('effort', CLAUDE_EFFORT),
+        ('resume', CLAUDE_RESUME_FROM),
+    )
+    for src, dst in scalar_map:
+        if (value := getattr(options, src, None)) is not None:
+            attrs[dst] = value
+
+    # ``skills`` is ``list[str] | Literal["all"] | None``. Normalise the
+    # mixed-shape into a stable list-typed ``claude.skills`` plus a
+    # discriminator under ``claude.skills_mode`` so downstream typed
+    # stores (column-typed warehouses) see one shape.
+    if (skills := getattr(options, 'skills', None)) is not None:
+        if skills == 'all':
+            attrs[CLAUDE_SKILLS_MODE] = 'all'
+        else:
+            attrs[CLAUDE_SKILLS_MODE] = 'allowlist'
+            attrs[CLAUDE_SKILLS] = list(skills)
+
+    # Lists — emit when non-empty.
+    list_map: tuple[tuple[str, str], ...] = (
+        ('allowed_tools', CLAUDE_ALLOWED_TOOLS),
+        ('disallowed_tools', CLAUDE_DISALLOWED_TOOLS),
+        ('setting_sources', CLAUDE_SETTING_SOURCES),
+    )
+    for src, dst in list_map:
+        if value := getattr(options, src, None):
+            attrs[dst] = list(value)
+
+    # Booleans — emit only when True (non-default).
+    bool_map: tuple[tuple[str, str], ...] = (
+        ('continue_conversation', CLAUDE_CONTINUE_CONVERSATION),
+        ('include_partial_messages', CLAUDE_INCLUDE_PARTIAL_MESSAGES),
+        ('enable_file_checkpointing', CLAUDE_ENABLE_FILE_CHECKPOINTING),
+        ('fork_session', CLAUDE_FORK_ON_RESUME),
+    )
+    for src, dst in bool_map:
+        if getattr(options, src, False):
+            attrs[dst] = True
+
+    # ``agents`` is a dict of ``name → AgentDefinition``. Emit names only;
+    # only handle the dict shape because future SDK changes (e.g. to a
+    # ``list[AgentDefinition]``) would otherwise silently leak object
+    # reprs into the attribute.
+    agents = getattr(options, 'agents', None)
+    if isinstance(agents, dict) and agents:
+        attrs[CLAUDE_AGENTS] = sorted(agents.keys())
+
+    return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +493,7 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
                 span_data[SYSTEM_INSTRUCTIONS] = [TextPart(type='text', content=text)]
             if cwd := getattr(self.options, 'cwd', None):
                 span_data[CLAUDE_CWD] = str(cwd)
+            span_data.update(_options_attrs(self.options))
 
         with logfire_claude.span('invoke_agent', **span_data) as root_span:
             state = _ConversationState(
