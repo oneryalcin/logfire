@@ -171,6 +171,45 @@ CLAUDE_ENABLE_FILE_CHECKPOINTING = 'claude.enable_file_checkpointing'
 CLAUDE_RESUME_FROM = 'claude.resume_from'
 CLAUDE_FORK_ON_RESUME = 'claude.fork_on_resume'
 
+# Hook-event attributes (issue #9). Each non-tool-lifecycle hook that the
+# Claude Agent SDK fires (UserPromptSubmit / Stop / PreCompact / Notification
+# / PermissionRequest) emits a level-appropriate logfire log under the
+# active ``invoke_agent`` span. Cumulative counts are aggregated on the
+# root span at conversation close (mirroring ``claude.tools_used``).
+#
+# Naming: counter attrs use a bare ``_count`` suffix (``claude.compact_count``)
+# rather than nesting under the per-event sub-namespace (``claude.compact.count``)
+# — they are root-span session aggregates, analogous to ``claude.tools_used``,
+# not per-event detail attributes. Don't "fix" this asymmetry without
+# updating the dashboards that key on these names.
+#
+# SAFE_KEYS additions: ``claude.compact.custom_instructions`` and
+# ``claude.stop.last_assistant_message`` carry model-generated /
+# operator-set text that default regex scrubbing would over-redact;
+# ``claude.user_prompt`` deliberately stays subject to scrubbing because
+# user-typed prompts may contain credentials. See scrubbing.py for the
+# exact allowlist.
+CLAUDE_USER_PROMPT = 'claude.user_prompt'
+CLAUDE_USER_PROMPT_COUNT = 'claude.user_prompt_count'
+CLAUDE_STOP_HOOK_ACTIVE = 'claude.stop.hook_active'
+# ``last_assistant_message`` is on the wire but not in the SDK's StopHookInput
+# type; capture defensively via .get().
+CLAUDE_STOP_LAST_ASSISTANT_MESSAGE = 'claude.stop.last_assistant_message'
+CLAUDE_COMPACT_TRIGGER = 'claude.compact.trigger'
+CLAUDE_COMPACT_INSTRUCTIONS = 'claude.compact.custom_instructions'
+CLAUDE_COMPACT_COUNT = 'claude.compact_count'
+CLAUDE_NOTIFICATION_MESSAGE = 'claude.notification.message'
+CLAUDE_NOTIFICATION_TITLE = 'claude.notification.title'
+CLAUDE_NOTIFICATION_TYPE = 'claude.notification.type'
+CLAUDE_NOTIFICATION_COUNT = 'claude.notification_count'
+CLAUDE_PERMISSION_REQUEST_TOOL_INPUT = 'claude.permission_request.tool_input'
+CLAUDE_PERMISSION_REQUEST_SUGGESTIONS = 'claude.permission_request.suggestions'
+CLAUDE_PERMISSION_REQUEST_COUNT = 'claude.permission_request_count'
+# Subagent attribution (also surfaced from PermissionRequest hooks fired
+# inside a subagent context — groundwork for issue #3).
+CLAUDE_AGENT_ID = 'claude.agent_id'
+CLAUDE_AGENT_TYPE = 'claude.agent_type'
+
 # Type definitions for message parts and messages
 
 

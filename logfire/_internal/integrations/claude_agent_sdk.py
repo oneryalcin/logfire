@@ -32,8 +32,13 @@ from opentelemetry import context as context_api, trace as trace_api
 
 from logfire._internal.integrations.llm_providers.semconv import (
     AGENT_NAME,
+    CLAUDE_AGENT_ID,
+    CLAUDE_AGENT_TYPE,
     CLAUDE_AGENTS,
     CLAUDE_ALLOWED_TOOLS,
+    CLAUDE_COMPACT_COUNT,
+    CLAUDE_COMPACT_INSTRUCTIONS,
+    CLAUDE_COMPACT_TRIGGER,
     CLAUDE_CONTINUE_CONVERSATION,
     CLAUDE_CWD,
     CLAUDE_DISALLOWED_TOOLS,
@@ -45,11 +50,18 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_MAX_TURNS,
     CLAUDE_MESSAGE_UUID,
     CLAUDE_MODEL_USAGE,
+    CLAUDE_NOTIFICATION_COUNT,
+    CLAUDE_NOTIFICATION_MESSAGE,
+    CLAUDE_NOTIFICATION_TITLE,
+    CLAUDE_NOTIFICATION_TYPE,
     CLAUDE_OPTIONS_FALLBACK_MODEL,
     CLAUDE_OPTIONS_MODEL,
     CLAUDE_PARENT_TOOL_USE_ID,
     CLAUDE_PERMISSION_DENIALS,
     CLAUDE_PERMISSION_MODE,
+    CLAUDE_PERMISSION_REQUEST_COUNT,
+    CLAUDE_PERMISSION_REQUEST_SUGGESTIONS,
+    CLAUDE_PERMISSION_REQUEST_TOOL_INPUT,
     CLAUDE_RESULT_ERRORS,
     CLAUDE_RESULT_STRUCTURED_OUTPUT,
     CLAUDE_RESULT_SUBTYPE,
@@ -58,7 +70,11 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_SETTING_SOURCES,
     CLAUDE_SKILLS,
     CLAUDE_SKILLS_MODE,
+    CLAUDE_STOP_HOOK_ACTIVE,
+    CLAUDE_STOP_LAST_ASSISTANT_MESSAGE,
     CLAUDE_TOOLS_USED,
+    CLAUDE_USER_PROMPT,
+    CLAUDE_USER_PROMPT_COUNT,
     CONVERSATION_ID,
     ERROR_TYPE,
     INPUT_MESSAGES,
@@ -416,6 +432,124 @@ async def post_tool_use_failure_hook(
 
 
 # ---------------------------------------------------------------------------
+# Hook callbacks for non-tool-lifecycle events (issue #9).
+#
+# Empirically the SDK passes a freshly-allocated UUID as ``tool_use_id`` for
+# these events too — so the ``if not tool_use_id`` early-bail used by the
+# tool-lifecycle hooks above is intentionally absent here. Each callback is a
+# thin shim that runs a matching ``_record_*`` helper inside the root span's
+# OTel context (hooks run in different anyio tasks → contextvars don't
+# propagate; without explicit attach the emitted log lands as an orphan
+# top-level span rather than nested under ``invoke_agent``).
+# ---------------------------------------------------------------------------
+
+
+def _attach_root_context(state: _ConversationState) -> Any:
+    """Temporarily attach the root span as the active OTel context.
+
+    Mirrors the attach/detach pattern used by ``pre_tool_use_hook``. Returns
+    a token to pass to ``context_api.detach`` once the emission is done.
+    Returns ``None`` if the span is missing — caller should noop.
+    """
+    otel_span = state.root_span._span  # pyright: ignore[reportPrivateUsage]
+    if otel_span is None:  # pragma: no cover
+        return None
+    parent_ctx = trace_api.set_span_in_context(otel_span)
+    return context_api.attach(parent_ctx)
+
+
+async def _run_hook(
+    record_fn: Any,
+    input_data: Any,
+) -> None:
+    """Shared boilerplate for the 5 issue-#9 hook callbacks.
+
+    Each callback runs ``record_fn(state, input_data)`` inside the root
+    span's OTel context (hooks run in different anyio tasks so contextvars
+    don't propagate; without explicit attach the emitted log lands as an
+    orphan top-level span rather than nested under ``invoke_agent``).
+    """
+    with handle_internal_errors:
+        state = _get_state()
+        if state is None:  # pragma: no cover
+            return
+        token = _attach_root_context(state)
+        if token is None:  # pragma: no cover
+            return
+        try:
+            record_fn(state, input_data)
+        finally:
+            context_api.detach(token)
+
+
+async def user_prompt_submit_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: HookContext,
+) -> SyncHookJSONOutput:
+    """Surface the prompt the user just submitted as an info-level log."""
+    await _run_hook(_record_user_prompt_submit, input_data)
+    return {}
+
+
+async def stop_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: HookContext,
+) -> SyncHookJSONOutput:
+    """Surface the end-of-turn Stop event as an info-level log.
+
+    Does **not** close the chat span here: ``_ConversationState`` already
+    closes it on ``UserMessage`` / ``ResultMessage`` boundaries, and racing
+    the close from a hook running in a different anyio task only adds risk
+    for marginal value.
+    """
+    await _run_hook(_record_stop, input_data)
+    return {}
+
+
+async def pre_compact_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: HookContext,
+) -> SyncHookJSONOutput:
+    """Surface upcoming context-window compaction as a warn-level log.
+
+    Compaction is the strongest leading signal of context pressure on long
+    sessions; warn level keeps it filterable in dashboards without being
+    treated as an error.
+    """
+    await _run_hook(_record_pre_compact, input_data)
+    return {}
+
+
+async def notification_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: HookContext,
+) -> SyncHookJSONOutput:
+    """Surface CLI-emitted notifications as info-level logs."""
+    await _run_hook(_record_notification, input_data)
+    return {}
+
+
+async def permission_request_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: HookContext,
+) -> SyncHookJSONOutput:
+    """Surface tool-permission *requests* (the ask, not the outcome) as info-level logs.
+
+    The corresponding *outcome* path — ``PermissionResultDeny`` from the
+    ``can_use_tool`` callback and ``PreToolUse.updatedInput`` mutations —
+    is the territory of issue #10, not this hook. See the recon comment
+    on issue #9 for the boundary rationale.
+    """
+    await _run_hook(_record_permission_request, input_data)
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Instrumentation entry point.
 # ---------------------------------------------------------------------------
 
@@ -563,11 +697,22 @@ def _inject_tracing_hooks(options: Any) -> None:
             return
         options._logfire_hooks_injected = True
 
-        for event in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure'):
+        # Tool-lifecycle hooks (existing) + non-tool-lifecycle hooks (issue #9).
+        # The non-tool-lifecycle callbacks emit logfire log records under the
+        # active ``invoke_agent`` span; they don't open child spans.
+        events_to_callbacks: tuple[tuple[str, Any], ...] = (
+            ('PreToolUse', pre_tool_use_hook),
+            ('PostToolUse', post_tool_use_hook),
+            ('PostToolUseFailure', post_tool_use_failure_hook),
+            ('UserPromptSubmit', user_prompt_submit_hook),
+            ('Stop', stop_hook),
+            ('PreCompact', pre_compact_hook),
+            ('Notification', notification_hook),
+            ('PermissionRequest', permission_request_hook),
+        )
+        for event, callback in events_to_callbacks:
             hooks.setdefault(event, [])
-        hooks['PreToolUse'].insert(0, HookMatcher(matcher=None, hooks=[pre_tool_use_hook]))
-        hooks['PostToolUse'].insert(0, HookMatcher(matcher=None, hooks=[post_tool_use_hook]))
-        hooks['PostToolUseFailure'].insert(0, HookMatcher(matcher=None, hooks=[post_tool_use_failure_hook]))
+            hooks[event].insert(0, HookMatcher(matcher=None, hooks=[callback]))
 
 
 class _ConversationState:
@@ -596,6 +741,12 @@ class _ConversationState:
         self._current_output_parts: list[MessagePart] = []
         self._system_instructions = system_instructions
         self.model: str | None = None
+        # Hook-event counters (issue #9). Surfaced on the root span at
+        # ``close()`` so dashboards can group by session-level activity.
+        self.user_prompt_count = 0
+        self.compact_count = 0
+        self.notification_count = 0
+        self.permission_request_count = 0
 
     def add_tool_result(self, tool_use_id: str, tool_name: str, result: Any) -> None:
         """Record a tool result to include in the next chat span's input messages."""
@@ -720,6 +871,17 @@ class _ConversationState:
                     CLAUDE_TOOLS_USED,
                     [{'tool': n, 'count': c} for n, c in tool_counts.items()],
                 )
+        # Hook-event counters: emit only the non-zero ones so happy-path
+        # spans don't carry always-zero attributes.
+        counter_map: tuple[tuple[int, str], ...] = (
+            (self.user_prompt_count, CLAUDE_USER_PROMPT_COUNT),
+            (self.compact_count, CLAUDE_COMPACT_COUNT),
+            (self.notification_count, CLAUDE_NOTIFICATION_COUNT),
+            (self.permission_request_count, CLAUDE_PERMISSION_REQUEST_COUNT),
+        )
+        for value, attr in counter_map:
+            if value:
+                self.root_span.set_attribute(attr, value)
         for span in self.active_tool_spans.values():
             span._end()  # pyright: ignore[reportPrivateUsage]
         self.active_tool_spans.clear()
@@ -841,3 +1003,139 @@ def _record_result(span: LogfireSpan, msg: ResultMessage) -> None:
     is_error = getattr(msg, 'is_error', None)
     if is_error:
         span.set_level('error')
+
+
+# ---------------------------------------------------------------------------
+# Hook-event emission helpers (issue #9). Each emits a level-appropriate
+# logfire log under the active ``invoke_agent`` span — mirroring the
+# precedent set by ``_record_rate_limit_event`` / ``_record_mirror_error``.
+# Counters live on ``_ConversationState`` and are surfaced on the root span
+# when the conversation closes.
+# ---------------------------------------------------------------------------
+
+
+def _hook_session_id(input_data: Any) -> dict[str, Any]:
+    """Pull ``session_id`` from a hook input dict, mapped to the OTel semconv
+    ``gen_ai.conversation.id``. Returns ``{}`` when absent so callers can
+    splat it into a log call unconditionally.
+    """
+    sid = (input_data or {}).get('session_id') if isinstance(input_data, dict) else None
+    return {CONVERSATION_ID: sid} if sid else {}
+
+
+def _record_user_prompt_submit(state: _ConversationState, input_data: Any) -> None:
+    """Record a UserPromptSubmit hook event as an info log under the root span.
+
+    ``claude.user_prompt`` is intentionally NOT on the scrubber's SAFE_KEYS:
+    user-typed prompts may contain credentials and default value-level
+    redaction is the safer privacy posture. Operators who want raw prompts
+    can use a ``scrubbing_callback``.
+    """
+    state.user_prompt_count += 1
+    if not isinstance(input_data, dict):  # pragma: no cover
+        return
+    prompt = input_data.get('prompt')
+    attrs: dict[str, Any] = {**_hook_session_id(input_data)}
+    if prompt is not None:
+        attrs[CLAUDE_USER_PROMPT] = prompt
+    state.logfire.info('Hook: UserPromptSubmit', **attrs)
+
+
+def _record_stop(state: _ConversationState, input_data: Any) -> None:
+    """Record a Stop hook event as an info log under the root span.
+
+    Captures ``last_assistant_message`` defensively via ``.get()`` —
+    the field is on the CLI wire format but absent from the SDK's
+    ``StopHookInput`` type, so older SDKs (or future renames) silently
+    skip the attribute. Goes through the scrubber's SAFE_KEYS allowlist
+    because it's model-generated text (mirrors ``claude.result.text``).
+    """
+    if not isinstance(input_data, dict):  # pragma: no cover
+        return
+    attrs: dict[str, Any] = {**_hook_session_id(input_data)}
+    # Emit ``stop_hook_active`` only when True — almost always False.
+    if input_data.get('stop_hook_active'):
+        attrs[CLAUDE_STOP_HOOK_ACTIVE] = True
+    last = input_data.get('last_assistant_message')
+    if last is not None:
+        attrs[CLAUDE_STOP_LAST_ASSISTANT_MESSAGE] = last
+    state.logfire.info('Hook: Stop', **attrs)
+
+
+def _record_pre_compact(state: _ConversationState, input_data: Any) -> None:
+    """Record a PreCompact hook event as a warn log under the root span.
+
+    Compaction is the strongest leading indicator that the session is
+    approaching context limits; warn level keeps it filterable / alertable
+    without being treated as a hard error.
+    """
+    state.compact_count += 1
+    if not isinstance(input_data, dict):  # pragma: no cover
+        return
+    attrs: dict[str, Any] = {**_hook_session_id(input_data)}
+    if (trigger := input_data.get('trigger')) is not None:
+        attrs[CLAUDE_COMPACT_TRIGGER] = trigger
+    if (instructions := input_data.get('custom_instructions')) is not None:
+        attrs[CLAUDE_COMPACT_INSTRUCTIONS] = instructions
+    state.logfire.warn('Hook: PreCompact ({trigger})', trigger=attrs.get(CLAUDE_COMPACT_TRIGGER, ''), **attrs)
+
+
+def _record_notification(state: _ConversationState, input_data: Any) -> None:
+    """Record a Notification hook event as an info log under the root span.
+
+    ``claude.notification.message`` is NOT on SAFE_KEYS: CLI-emitted text
+    can contain paths/words triggering false-positive scrubbing, and
+    accepting that is preferable to allowlisting CLI-controlled content
+    that may evolve.
+    """
+    state.notification_count += 1
+    if not isinstance(input_data, dict):  # pragma: no cover
+        return
+    attrs: dict[str, Any] = {**_hook_session_id(input_data)}
+    field_map: tuple[tuple[str, str], ...] = (
+        ('message', CLAUDE_NOTIFICATION_MESSAGE),
+        ('title', CLAUDE_NOTIFICATION_TITLE),
+        ('notification_type', CLAUDE_NOTIFICATION_TYPE),
+    )
+    for sdk_field, attr_name in field_map:
+        if (value := input_data.get(sdk_field)) is not None:
+            attrs[attr_name] = value
+    state.logfire.info(
+        'Hook: Notification ({notification_type})',
+        notification_type=attrs.get(CLAUDE_NOTIFICATION_TYPE, ''),
+        **attrs,
+    )
+
+
+def _record_permission_request(state: _ConversationState, input_data: Any) -> None:
+    """Record a PermissionRequest hook event as an info-level audit log.
+
+    Captures ``agent_id`` / ``agent_type`` opportunistically when the
+    request originates inside a subagent context (groundwork for #3).
+    ``permission_suggestions`` shape is uncertain (``list[Any]``) — capture
+    when truthy without imposing a sub-schema we'd have to break later.
+    ``tool_input`` is caller-supplied arbitrary user data — deliberately
+    NOT on SAFE_KEYS, matching the ``claude.permission_denials`` precedent.
+    """
+    state.permission_request_count += 1
+    if not isinstance(input_data, dict):  # pragma: no cover
+        return
+    attrs: dict[str, Any] = {**_hook_session_id(input_data)}
+    field_map: tuple[tuple[str, str], ...] = (
+        ('tool_name', TOOL_NAME),
+        ('tool_input', CLAUDE_PERMISSION_REQUEST_TOOL_INPUT),
+        ('agent_id', CLAUDE_AGENT_ID),
+        ('agent_type', CLAUDE_AGENT_TYPE),
+    )
+    for sdk_field, attr_name in field_map:
+        if (value := input_data.get(sdk_field)) is not None:
+            attrs[attr_name] = value
+    # ``permission_suggestions`` shape is uncertain (``list[Any]``) — capture
+    # only when truthy so we don't emit empty lists.
+    if suggestions := input_data.get('permission_suggestions'):
+        attrs[CLAUDE_PERMISSION_REQUEST_SUGGESTIONS] = suggestions
+    state.logfire.info(
+        'Hook: PermissionRequest ({tool_name})',
+        tool_name=attrs.get(TOOL_NAME, ''),
+        **attrs,
+    )

@@ -87,10 +87,23 @@ Server-side tools do **not** trigger the `PreToolUse` / `PostToolUse` hooks (tho
 
 ## Additional events captured
 
-The integration also surfaces two non-message stream events as logs nested under the `invoke_agent` span:
+The integration surfaces non-message stream events as logs nested under the `invoke_agent` span. Stream-source events:
 
 - **Rate-limit transitions** (`RateLimitEvent`): emitted whenever the CLI reports a rate-limit state change (`allowed` → `allowed_warning` → `rejected`) or overage state, with `gen_ai.rate_limit.status`, `.type`, `.utilization`, `.resets_at`, and a `.raw` passthrough. `rejected` escalates the enclosing `invoke_agent` span to error level.
 - **Session-store mirror errors** (`MirrorErrorMessage`): error-level logs when the configured `SessionStore` fails to mirror a transcript line. The local-disk transcript is unaffected.
+
+Hook-callback events (registered automatically on the `ClaudeAgentOptions.hooks` mapping):
+
+- **`Hook: UserPromptSubmit`** (info): emitted on every `client.query()` with `claude.user_prompt` carrying the submitted text and `gen_ai.conversation.id`. The prompt attribute deliberately stays subject to value-level scrubbing — user-typed prompts may contain credentials and default-on redaction is the safer privacy posture; deployments that need raw prompts can opt-out per-attribute via a `scrubbing_callback`.
+- **`Hook: Stop`** (info): emitted at end-of-turn with `claude.stop.last_assistant_message` (the verbatim final assistant text — model-generated content, allowlisted from scrubbing) and `claude.stop.hook_active` (only when `True`). The `last_assistant_message` field is captured defensively via `.get()` because the SDK type definition doesn't declare it; the integration silently skips it if a future SDK release renames the wire field.
+- **`Hook: PreCompact`** (warn): emitted before the CLI compacts the context window. Carries `claude.compact.trigger` (`"manual"` for `/compact` or `"auto"` for context-pressure triggered) and `claude.compact.custom_instructions` (operator-set guidance text, allowlisted from scrubbing). Warn level keeps it filterable / alertable as the strongest leading indicator of context pressure on long sessions.
+- **`Hook: Notification`** (info): emitted for CLI-emitted notifications. Carries `claude.notification.message`, `claude.notification.title` (when set), and `claude.notification.type`. The message attribute stays subject to default scrubbing because CLI-emitted text can evolve; allowlisting it would risk masking future regressions.
+- **`Hook: PermissionRequest`** (info): emitted as an audit log when the CLI requests permission to invoke a tool. Carries `gen_ai.tool.name`, `claude.permission_request.tool_input` (NOT allowlisted — caller-supplied arbitrary data, mirroring the `claude.permission_denials` precedent), `claude.permission_request.suggestions` when non-empty, and subagent attribution (`claude.agent_id` / `claude.agent_type`) when the request originates inside a subagent context.
+
+The `Hook:` prefix is a deliberate UX choice for trace readability — it makes hook-callback events visually distinct from SDK-generated stream events when scanning a session.
+
+!!! note "PermissionRequest, Notification, and PreCompact under non-interactive transport"
+    These three hooks are gated on interactive-TTY presence in the CLI. They typically don't fire during `ClaudeSDKClient` sessions running in scripted / non-interactive transport mode — even when the operations they describe are happening. The integration captures them when they do fire (e.g. inside an interactive terminal session) without requiring any opt-in. `UserPromptSubmit` and `Stop` fire on every query / turn and are always observable.
 
 ## End-of-conversation result fields
 
@@ -113,6 +126,7 @@ The `invoke_agent` root span is finalised with the full conversation and aggrega
 
 - `pydantic_ai.all_messages` — full conversation (user prompt, assistant turns, tool invocations, tool responses). This is the attribute that triggers Logfire's "Agent Run" chat-view rendering on the root span; without it the root only shows metadata and you have to drill into per-turn `chat` spans. The attribute name is a Logfire UI convention (originally established by `pydantic-ai`) and is already allowlisted by the scrubber.
 - `claude.tools_used` — aggregated invocation counts as `[{"tool": name, "count": n}, ...]` across client, MCP, and server tools. Useful for dashboards that summarise tool usage per session without needing to traverse the message array.
+- `claude.user_prompt_count` / `claude.compact_count` / `claude.notification_count` / `claude.permission_request_count` — per-conversation cumulative counts of the respective hook-callback events. Emitted only when non-zero so happy-path spans don't carry always-zero attrs. The bare `_count` suffix (rather than nesting under each event's sub-namespace) is intentional — these are root-span session aggregates, mirroring the `claude.tools_used` precedent.
 - `gen_ai.agent.name` — the agent framework identifier (currently fixed to `claude-code`).
 - `claude.cwd` — the working directory from `ClaudeAgentOptions.cwd`, when set. Intentionally under the `claude.*` namespace rather than `session.*` so value-level scrubbing (e.g. paths containing `secret` / `private_key` / `auth`) still applies.
 
