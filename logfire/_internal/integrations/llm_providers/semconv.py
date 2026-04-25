@@ -235,6 +235,29 @@ CLAUDE_PERMISSION_RESULT_UPDATED_PERMISSIONS = 'claude.permission_result.updated
 # value lands here. Absent on the happy path where pre == executed.
 CLAUDE_TOOL_CALL_ARGUMENTS_ORIGINAL = 'claude.tool_call.arguments.original'
 
+# Lifecycle / control-method attributes (issue #11). Captured on the spans
+# wrapping ``ClaudeSDKClient.connect`` / ``disconnect`` / ``set_model`` /
+# ``set_permission_mode`` / ``rewind_files`` / ``reconnect_mcp_server`` /
+# ``toggle_mcp_server`` / ``stop_task`` / ``interrupt``.
+#
+# None on SAFE_KEYS:
+#   * ``claude.process.stderr`` and ``claude.cli_path`` can carry filesystem
+#     paths matching default scrub patterns (``auth``, ``secret``,
+#     ``private_key``, etc.) — value-level redaction is the safer default.
+#   * The remaining attrs (``exit_code`` int, ``mcp.enabled`` bool,
+#     ``mcp.server_name`` / ``task_id`` / ``rewind.user_message_id`` —
+#     short operator-set identifiers) are not type-sensitive but are also
+#     omitted from SAFE_KEYS for symmetry; default scrubbing is a no-op
+#     on integers / booleans, and the identifier strings are unlikely
+#     to legitimately contain credentials.
+CLAUDE_CLI_PATH = 'claude.cli_path'
+CLAUDE_PROCESS_EXIT_CODE = 'claude.process.exit_code'
+CLAUDE_PROCESS_STDERR = 'claude.process.stderr'
+CLAUDE_REWIND_USER_MESSAGE_ID = 'claude.rewind.user_message_id'
+CLAUDE_MCP_SERVER_NAME = 'claude.mcp.server_name'
+CLAUDE_MCP_ENABLED = 'claude.mcp.enabled'
+CLAUDE_TASK_ID = 'claude.task_id'
+
 # Type definitions for message parts and messages
 
 
