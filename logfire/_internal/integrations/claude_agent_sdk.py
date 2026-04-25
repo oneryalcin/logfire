@@ -36,6 +36,7 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_AGENT_TYPE,
     CLAUDE_AGENTS,
     CLAUDE_ALLOWED_TOOLS,
+    CLAUDE_CLI_PATH,
     CLAUDE_COMPACT_COUNT,
     CLAUDE_COMPACT_INSTRUCTIONS,
     CLAUDE_COMPACT_TRIGGER,
@@ -48,6 +49,8 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_INCLUDE_PARTIAL_MESSAGES,
     CLAUDE_MAX_BUDGET_USD,
     CLAUDE_MAX_TURNS,
+    CLAUDE_MCP_ENABLED,
+    CLAUDE_MCP_SERVER_NAME,
     CLAUDE_MESSAGE_UUID,
     CLAUDE_MODEL_USAGE,
     CLAUDE_NOTIFICATION_COUNT,
@@ -67,16 +70,20 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_PERMISSION_RESULT_MESSAGE,
     CLAUDE_PERMISSION_RESULT_UPDATED_INPUT,
     CLAUDE_PERMISSION_RESULT_UPDATED_PERMISSIONS,
+    CLAUDE_PROCESS_EXIT_CODE,
+    CLAUDE_PROCESS_STDERR,
     CLAUDE_RESULT_ERRORS,
     CLAUDE_RESULT_STRUCTURED_OUTPUT,
     CLAUDE_RESULT_SUBTYPE,
     CLAUDE_RESULT_TEXT,
     CLAUDE_RESUME_FROM,
+    CLAUDE_REWIND_USER_MESSAGE_ID,
     CLAUDE_SETTING_SOURCES,
     CLAUDE_SKILLS,
     CLAUDE_SKILLS_MODE,
     CLAUDE_STOP_HOOK_ACTIVE,
     CLAUDE_STOP_LAST_ASSISTANT_MESSAGE,
+    CLAUDE_TASK_ID,
     CLAUDE_TOOL_CALL_ARGUMENTS_ORIGINAL,
     CLAUDE_TOOLS_USED,
     CLAUDE_USER_PROMPT,
@@ -619,6 +626,19 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
     original_init = cls.__init__
     original_query = cls.query
     original_receive_response = cls.receive_response
+    # Issue #11 — methods we may or may not be able to patch depending on the
+    # installed SDK version. ``getattr(... , None)`` so older SDKs without one
+    # of these methods don't crash on import; we just skip the patch.
+    original_receive_messages = getattr(cls, 'receive_messages', None)
+    original_connect = getattr(cls, 'connect', None)
+    original_disconnect = getattr(cls, 'disconnect', None)
+    original_interrupt = getattr(cls, 'interrupt', None)
+    original_set_permission_mode = getattr(cls, 'set_permission_mode', None)
+    original_set_model = getattr(cls, 'set_model', None)
+    original_rewind_files = getattr(cls, 'rewind_files', None)
+    original_reconnect_mcp_server = getattr(cls, 'reconnect_mcp_server', None)
+    original_toggle_mcp_server = getattr(cls, 'toggle_mcp_server', None)
+    original_stop_task = getattr(cls, 'stop_task', None)
 
     cls._is_instrumented_by_logfire = True  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -651,9 +671,21 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
 
     cls.query = patched_query
 
-    # --- Patch receive_response ---
-    @functools.wraps(original_receive_response)
-    async def patched_receive_response(self: Any) -> AsyncGenerator[Any, None]:
+    # --- Shared body for receive_response / receive_messages ---
+    # Both iterators open the same ``invoke_agent`` lifecycle and run the
+    # same message-dispatch loop. Factored so issue #11 can patch
+    # ``receive_messages`` without copy-pasting the entire body — the
+    # alternate iterator was previously a complete observability black hole.
+    async def _drive_invoke_agent(self: Any, source_iter: Any) -> AsyncGenerator[Any, None]:
+        # ``receive_response`` calls ``self.receive_messages()`` internally
+        # (see SDK ``client.py:566-580``). When both are patched, the inner
+        # call would open a nested ``invoke_agent`` span — wrong. Detect the
+        # nesting here and delegate without re-wrapping if state is already set.
+        if _get_state() is not None:
+            async for msg in source_iter:
+                yield msg
+            return
+
         prompt = getattr(self, '_logfire_prompt', None)
         input_messages: list[ChatMessage] = []
         if prompt:  # pragma: no branch
@@ -688,7 +720,7 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
             state.open_chat_span()
 
             try:
-                async for msg in original_receive_response(self):
+                async for msg in source_iter:
                     with handle_internal_errors:
                         if isinstance(msg, AssistantMessage):
                             state.handle_assistant_message(msg)
@@ -709,19 +741,197 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
                 state.close()
                 _clear_state()
 
+    # --- Patch receive_response ---
+    @functools.wraps(original_receive_response)
+    async def patched_receive_response(self: Any) -> AsyncGenerator[Any, None]:
+        async for msg in _drive_invoke_agent(self, original_receive_response(self)):
+            yield msg
+
     cls.receive_response = patched_receive_response
+
+    # --- Patch receive_messages (issue #11) ---
+    # Without this, sessions using ``receive_messages`` instead of
+    # ``receive_response`` produce ZERO logfire spans — empirically confirmed
+    # in issue #11's baseline harness.
+    if original_receive_messages is not None:
+
+        @functools.wraps(original_receive_messages)
+        async def patched_receive_messages(self: Any) -> AsyncGenerator[Any, None]:
+            async for msg in _drive_invoke_agent(self, original_receive_messages(self)):
+                yield msg
+
+        cls.receive_messages = patched_receive_messages
+    else:  # pragma: no cover
+        patched_receive_messages = None
+
+    # --- Patch connect / disconnect (issue #11) ---
+    # Lifecycle spans capture CLI-startup latency (a real tail-latency
+    # contributor) and surface ``CLINotFoundError`` / ``ProcessError`` /
+    # ``CLIConnectionError`` that today vanish silently into user code.
+    if original_connect is not None:
+
+        @functools.wraps(original_connect)
+        async def patched_connect(self: Any, *args: Any, **kwargs: Any) -> Any:
+            attrs: dict[str, Any] = {}
+            cli_path = getattr(getattr(self, 'options', None), 'cli_path', None)
+            if cli_path is not None:
+                attrs[CLAUDE_CLI_PATH] = str(cli_path)
+            with _traced_span(logfire_claude, 'connect', **attrs):
+                return await original_connect(self, *args, **kwargs)
+
+        cls.connect = patched_connect
+
+    if original_disconnect is not None:
+
+        @functools.wraps(original_disconnect)
+        async def patched_disconnect(self: Any, *args: Any, **kwargs: Any) -> Any:
+            with _traced_span(logfire_claude, 'disconnect'):
+                return await original_disconnect(self, *args, **kwargs)
+
+        cls.disconnect = patched_disconnect
+
+    # --- Patch control methods (issue #11) ---
+    # All control methods share the same shape: open a short span, capture
+    # the relevant input under a claude.* attr, await the original, surface
+    # any error. Generated via a small factory so each patch is one line of
+    # configuration rather than a copy-paste block.
+    control_method_specs: tuple[tuple[str, Any, str | None], ...] = (
+        ('interrupt', original_interrupt, None),
+        ('set_permission_mode', original_set_permission_mode, CLAUDE_PERMISSION_MODE),
+        ('set_model', original_set_model, REQUEST_MODEL),
+        ('rewind_files', original_rewind_files, CLAUDE_REWIND_USER_MESSAGE_ID),
+        ('stop_task', original_stop_task, CLAUDE_TASK_ID),
+    )
+    for span_name, original_method, attr_key in control_method_specs:
+        if original_method is None:  # pragma: no cover
+            continue
+        setattr(cls, span_name, _make_control_patch(logfire_claude, span_name, original_method, attr_key))
+
+    # MCP methods take ``server_name`` as the first arg; reconnect has just
+    # that, toggle has both ``server_name`` and ``enabled``. Different
+    # surface shape from the simple ``(value)`` control methods above so
+    # patched separately. Span names get a ``mcp.`` prefix because they're
+    # sub-domain operations (two methods, one server-name surface) rather
+    # than session-lifecycle calls — group cleanly in dashboards filtering
+    # by span_name.
+    if original_reconnect_mcp_server is not None:
+
+        @functools.wraps(original_reconnect_mcp_server)
+        async def patched_reconnect_mcp_server(self: Any, server_name: str, *args: Any, **kwargs: Any) -> Any:
+            with _traced_span(logfire_claude, 'mcp.reconnect', **{CLAUDE_MCP_SERVER_NAME: server_name}):
+                return await original_reconnect_mcp_server(self, server_name, *args, **kwargs)
+
+        cls.reconnect_mcp_server = patched_reconnect_mcp_server
+
+    if original_toggle_mcp_server is not None:
+
+        @functools.wraps(original_toggle_mcp_server)
+        async def patched_toggle_mcp_server(self: Any, server_name: str, enabled: bool, *args: Any, **kwargs: Any) -> Any:
+            with _traced_span(
+                logfire_claude,
+                'mcp.toggle',
+                **{CLAUDE_MCP_SERVER_NAME: server_name, CLAUDE_MCP_ENABLED: enabled},
+            ):
+                return await original_toggle_mcp_server(self, server_name, enabled, *args, **kwargs)
+
+        cls.toggle_mcp_server = patched_toggle_mcp_server
 
     @contextmanager
     def uninstrument_context():
         try:
             yield
         finally:
+            # Pre-#11 methods are guaranteed to exist on every SDK version
+            # the integration supports — restore unconditionally.
             cls.__init__ = original_init
             cls.query = original_query
             cls.receive_response = original_receive_response
+            # Issue-#11 methods are conditionally present (e.g. ``rewind_files``
+            # / ``stop_task`` / ``reconnect_mcp_server`` are recent additions);
+            # restore only what we captured to avoid setting stale-None on
+            # older SDKs.
+            for attr, original in (
+                ('receive_messages', original_receive_messages),
+                ('connect', original_connect),
+                ('disconnect', original_disconnect),
+                ('interrupt', original_interrupt),
+                ('set_permission_mode', original_set_permission_mode),
+                ('set_model', original_set_model),
+                ('rewind_files', original_rewind_files),
+                ('reconnect_mcp_server', original_reconnect_mcp_server),
+                ('toggle_mcp_server', original_toggle_mcp_server),
+                ('stop_task', original_stop_task),
+            ):
+                if original is not None:
+                    setattr(cls, attr, original)
             cls._is_instrumented_by_logfire = False  # pyright: ignore[reportAttributeAccessIssue]
 
     return uninstrument_context()
+
+
+def _annotate_error_span(span: LogfireSpan, exc: BaseException) -> None:
+    """Annotate a span with error.type + level=error before re-raising.
+
+    For ``ProcessError`` (the only SDK exception class that carries
+    structured detail), also surfaces ``exit_code`` and a truncated
+    ``stderr`` (first 200 chars — the field can carry megabytes of
+    subprocess output). Only invoked from the issue-#11 lifecycle/control
+    method patches.
+    """
+    span.set_attribute(ERROR_TYPE, exc.__class__.__name__)
+    span.set_level('error')
+    process_error = getattr(claude_agent_sdk, 'ProcessError', None)
+    if process_error is not None and isinstance(exc, process_error):
+        if (exit_code := getattr(exc, 'exit_code', None)) is not None:
+            span.set_attribute(CLAUDE_PROCESS_EXIT_CODE, exit_code)
+        if (stderr := getattr(exc, 'stderr', None)) is not None:
+            span.set_attribute(CLAUDE_PROCESS_STDERR, str(stderr)[:200])
+
+
+@contextmanager
+def _traced_span(logfire_claude: Logfire, span_name: str, **attrs: Any) -> Any:
+    """Open a span and annotate any escaping exception via ``_annotate_error_span``.
+
+    Shared by every issue-#11 lifecycle/control patch — see ``_annotate_error_span``
+    for the annotation contract.
+    """
+    with logfire_claude.span(span_name, **attrs) as span:
+        try:
+            yield span
+        except BaseException as exc:
+            _annotate_error_span(span, exc)
+            raise
+
+
+def _make_control_patch(
+    logfire_claude: Logfire,
+    span_name: str,
+    original_method: Any,
+    attr_key: str | None,
+) -> Any:
+    """Factory for the simple control-method patches (issue #11).
+
+    Each control method (``set_model`` / ``set_permission_mode`` / ...)
+    has the same span shape: open a span named after the method, optionally
+    capture the first positional / keyword arg under a claude.* attribute,
+    await the original, mark error on exception. Factored so adding a new
+    method is one line in ``control_method_specs``.
+
+    ``attr_key=None`` means the method takes no observable input
+    (``interrupt``); the span carries timing only.
+    """
+
+    @functools.wraps(original_method)
+    async def patched(self: Any, *args: Any, **kwargs: Any) -> Any:
+        attrs: dict[str, Any] = {}
+        if attr_key is not None:
+            value = args[0] if args else next(iter(kwargs.values()), None)
+            if value is not None:
+                attrs[attr_key] = value
+        with _traced_span(logfire_claude, span_name, **attrs):
+            return await original_method(self, *args, **kwargs)
+
+    return patched
 
 
 def _inject_tracing_hooks(options: Any) -> None:

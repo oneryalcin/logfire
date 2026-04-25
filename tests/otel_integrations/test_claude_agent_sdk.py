@@ -40,12 +40,14 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from claude_agent_sdk._errors import CLINotFoundError, ProcessError
 from claude_agent_sdk.types import HookContext
 from dirty_equals import IsStr
 from inline_snapshot import snapshot
 
 import logfire
 from logfire._internal.integrations.claude_agent_sdk import (
+    _annotate_error_span,
     _clear_state,
     _content_blocks_to_output_messages,
     _ConversationState,
@@ -619,9 +621,9 @@ def test_options_attrs_rejects_non_options_object() -> None:
     from types import SimpleNamespace
 
     fake = SimpleNamespace(
-        model=123,                       # wrong type
-        permission_mode=['nonsense'],    # wrong type
-        max_turns='five',                # wrong type
+        model=123,  # wrong type
+        permission_mode=['nonsense'],  # wrong type
+        max_turns='five',  # wrong type
     )
     assert _options_attrs(fake) == {}
 
@@ -1470,7 +1472,8 @@ async def test_record_permission_result_allow_with_mutation_logs_updated_input(e
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     log = next(
-        s for s in spans
+        s
+        for s in spans
         if s['name'] == 'Hook: PermissionResult ({behavior})'
         and s['attributes'].get('claude.permission_result.behavior') == 'allow'
     )
@@ -1492,7 +1495,8 @@ async def test_record_permission_result_allow_plain_skips_updated_attrs(exporter
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     log = next(
-        s for s in spans
+        s
+        for s in spans
         if s['name'] == 'Hook: PermissionResult ({behavior})'
         and s['attributes'].get('claude.permission_result.behavior') == 'allow'
     )
@@ -1576,7 +1580,8 @@ async def test_record_permission_result_deny_with_no_open_span(exporter: TestExp
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     log = next(
-        s for s in spans
+        s
+        for s in spans
         if s['name'] == 'Hook: PermissionResult ({behavior})'
         and s['attributes'].get('claude.permission_result.behavior') == 'deny'
     )
@@ -1599,7 +1604,8 @@ async def test_record_permission_result_deny_with_interrupt_true(exporter: TestE
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     log = next(
-        s for s in spans
+        s
+        for s in spans
         if s['name'] == 'Hook: PermissionResult ({behavior})'
         and s['attributes'].get('claude.permission_result.behavior') == 'deny'
     )
@@ -1659,7 +1665,8 @@ async def test_wrap_can_use_tool_emits_log_under_active_root(exporter: TestExpor
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     root_span = next(s for s in spans if s['name'] == 'invoke_agent')
     log = next(
-        s for s in spans
+        s
+        for s in spans
         if s['name'] == 'Hook: PermissionResult ({behavior})'
         and s['attributes'].get('claude.permission_result.behavior') == 'allow'
     )
@@ -1689,6 +1696,309 @@ def test_inject_hooks_skips_can_use_tool_when_none() -> None:
     assert options.can_use_tool is None
     _inject_tracing_hooks(options)
     assert options.can_use_tool is None
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle / control-method tests (issue #11).
+#
+# Each ``ClaudeSDKClient`` lifecycle (``connect`` / ``disconnect``) and
+# control method (``set_model`` / ``set_permission_mode`` / ``rewind_files``
+# / ``stop_task`` / ``interrupt`` / ``reconnect_mcp_server`` /
+# ``toggle_mcp_server``) is wrapped in a span. Six of these don't fire
+# under non-interactive SDK transport (need real CLI / MCP / file
+# checkpointing setup) and these unit tests are the only coverage they
+# get — assertions are intentionally specific.
+# ---------------------------------------------------------------------------
+
+
+def _make_dummy_client() -> ClaudeSDKClient:
+    """A ``ClaudeSDKClient`` with a stubbed-in ``_query`` so control methods
+    can be invoked without spinning up a real subprocess.
+
+    Distinct from ``_make_client`` (cassette-based, replays a recorded
+    session via ``fake_claude.py``): control methods operate on an
+    already-connected ``_query`` object — no transport / message stream
+    involvement — so a direct stub is the cleanest test surface.
+
+    The integration's ``patched_init`` runs ``_inject_tracing_hooks`` on
+    options, which is a no-op for our purposes here.
+    """
+
+    class _StubQuery:
+        async def interrupt(self) -> None:
+            return None
+
+        async def set_permission_mode(self, mode: str) -> None:
+            return None
+
+        async def set_model(self, model: str | None) -> None:
+            return None
+
+        async def rewind_files(self, user_message_id: str) -> None:
+            return None
+
+        async def reconnect_mcp_server(self, server_name: str) -> None:
+            return None
+
+        async def toggle_mcp_server(self, server_name: str, enabled: bool) -> None:
+            return None
+
+        async def stop_task(self, task_id: str) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    client = ClaudeSDKClient(options=ClaudeAgentOptions())
+    # Bypass ``connect`` — populate ``_query`` directly so the control
+    # methods' "Not connected" guards pass.
+    client._query = _StubQuery()  # type: ignore[assignment]
+    client._transport = Mock()
+    return client
+
+
+@pytest.mark.anyio
+async def test_receive_messages_produces_full_invoke_agent_tree(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, exporter: TestExporter
+) -> None:
+    """``receive_messages`` was a complete observability black hole pre-#11.
+    The patch makes it produce the same ``invoke_agent`` / ``chat`` /
+    ``Hook: *`` tree as ``receive_response``. Locks parity end-to-end via
+    a fake-claude cassette replay.
+    """
+    record = request.config.getoption('--record-claude-cassettes', default=False)
+    client = _make_client('basic_conversation.json', monkeypatch=monkeypatch, record=bool(record))
+    try:
+        await client.connect()
+        await client.query('What is 2+2?')
+        collected: list[Any] = []
+        async for msg in client.receive_messages():
+            collected.append(msg)
+            if any(type(m).__name__ == 'ResultMessage' for m in collected):
+                break
+    finally:
+        await _close_sdk_streams(client)
+        await client.disconnect()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    names = [s['name'] for s in spans]
+    # Single invoke_agent — the nesting fix prevents the inner call
+    # to receive_messages from opening a second one when patched.
+    assert names.count('invoke_agent') == 1
+    # Same body the receive_response cassette test asserts: chat span
+    # parented to invoke_agent, lifecycle spans top-level.
+    assert any(n.startswith('chat ') for n in names)
+    assert 'connect' in names
+    assert 'disconnect' in names
+
+
+@pytest.mark.anyio
+async def test_receive_response_calling_receive_messages_does_not_double_invoke_agent(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, exporter: TestExporter
+) -> None:
+    """``receive_response`` calls ``self.receive_messages()`` internally.
+    With both patched, naive wrapping would open two ``invoke_agent`` spans
+    (one per wrapper). The ``_drive_invoke_agent`` nesting check at
+    ``_get_state() is not None`` prevents this. Locks the contract.
+    """
+    record = request.config.getoption('--record-claude-cassettes', default=False)
+    client = _make_client('basic_conversation.json', monkeypatch=monkeypatch, record=bool(record))
+    try:
+        await client.connect()
+        await client.query('What is 2+2?')
+        async for _ in client.receive_response():
+            pass
+    finally:
+        await _close_sdk_streams(client)
+        await client.disconnect()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    invoke_agents = [s for s in spans if s['name'] == 'invoke_agent']
+    assert len(invoke_agents) == 1
+
+
+@pytest.mark.anyio
+async def test_connect_error_path_marks_span_with_error_type(exporter: TestExporter) -> None:
+    """``CLINotFoundError`` raised during ``connect`` produces a span at
+    error level with ``error.type='CLINotFoundError'`` (the short class name
+    via ``_annotate_error_span``). Locks the audit-trail for deployments
+    where the CLI binary goes missing — pre-#11 these errors vanished into
+    user code.
+    """
+    options = ClaudeAgentOptions(cli_path='/nonexistent/path/claude-cli')
+    client = ClaudeSDKClient(options=options)
+    with pytest.raises(CLINotFoundError):
+        await client.connect()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    connect_spans = [s for s in spans if s['name'] == 'connect']
+    # The SDK's ``connect()`` calls ``self.disconnect()`` in its except
+    # cleanup, so a child ``disconnect`` span lives under the failed
+    # ``connect``. We're asserting on the outer one.
+    failed_connect = next(s for s in connect_spans if s['attributes'].get('error.type') == 'CLINotFoundError')
+    assert failed_connect['attributes']['logfire.level_num'] == 17  # error
+    assert failed_connect['attributes']['claude.cli_path'] == '/nonexistent/path/claude-cli'
+
+
+@pytest.mark.anyio
+async def test_annotate_error_span_captures_process_error_detail(exporter: TestExporter) -> None:
+    """``_annotate_error_span`` uses ``isinstance(exc, ProcessError)`` to
+    surface ``exit_code`` + truncated ``stderr``. Other exception types
+    only get ``error.type`` + level=error.
+
+    Locked here because a real ``ProcessError`` is hard to provoke in a
+    unit test (requires a CLI subprocess that exits non-zero); driving
+    the helper directly is the cleanest coverage for the structured-detail
+    capture path.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+
+    # 250-char stderr to lock the 200-char truncation.
+    long_stderr = 'fatal: ' + ('x' * 250)
+    with logfire_instance.span('connect') as span:
+        _annotate_error_span(
+            span,
+            ProcessError(message='subprocess crashed', exit_code=137, stderr=long_stderr),
+        )
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(spans_iter for spans_iter in spans if spans_iter['name'] == 'connect')
+    assert s['attributes']['error.type'] == 'ProcessError'
+    assert s['attributes']['logfire.level_num'] == 17  # error
+    assert s['attributes']['claude.process.exit_code'] == 137
+    assert len(s['attributes']['claude.process.stderr']) == 200
+
+
+@pytest.mark.anyio
+async def test_set_model_captures_model_attribute(exporter: TestExporter) -> None:
+    """``set_model('claude-sonnet-4-6')`` produces a ``set_model`` span
+    with ``gen_ai.request.model`` set — the bit that makes mid-session
+    model switches visible for cost attribution.
+    """
+    client = _make_dummy_client()
+    await client.set_model('claude-sonnet-4-6')
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'set_model')
+    assert s['attributes']['gen_ai.request.model'] == 'claude-sonnet-4-6'
+
+
+@pytest.mark.anyio
+async def test_set_model_none_skips_attribute(exporter: TestExporter) -> None:
+    """``set_model(None)`` (revert to default) emits the span but no
+    ``gen_ai.request.model`` attr — locks the skip-when-None semantic
+    so a regression that started emitting ``model='None'`` strings is
+    caught."""
+    client = _make_dummy_client()
+    await client.set_model(None)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'set_model')
+    assert 'gen_ai.request.model' not in s['attributes']
+
+
+@pytest.mark.anyio
+async def test_set_permission_mode_captures_mode(exporter: TestExporter) -> None:
+    """``set_permission_mode('acceptEdits')`` → span with
+    ``claude.permission_mode='acceptEdits'``. Reuses the existing
+    ``CLAUDE_PERMISSION_MODE`` constant from the options-side capture
+    in #8."""
+    client = _make_dummy_client()
+    await client.set_permission_mode('acceptEdits')  # type: ignore[arg-type]
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'set_permission_mode')
+    assert s['attributes']['claude.permission_mode'] == 'acceptEdits'
+
+
+@pytest.mark.anyio
+async def test_rewind_files_captures_user_message_id(exporter: TestExporter) -> None:
+    client = _make_dummy_client()
+    await client.rewind_files('msg_uuid_abc')
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'rewind_files')
+    assert s['attributes']['claude.rewind.user_message_id'] == 'msg_uuid_abc'
+
+
+@pytest.mark.anyio
+async def test_stop_task_captures_task_id(exporter: TestExporter) -> None:
+    client = _make_dummy_client()
+    await client.stop_task('task_abc123')
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'stop_task')
+    assert s['attributes']['claude.task_id'] == 'task_abc123'
+
+
+@pytest.mark.anyio
+async def test_interrupt_emits_span_with_no_input_attrs(exporter: TestExporter) -> None:
+    """``interrupt`` takes no observable input — the span carries timing
+    only. Locks: the patch doesn't accidentally surface unrelated kwargs."""
+    client = _make_dummy_client()
+    await client.interrupt()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'interrupt')
+    for absent in (
+        'claude.permission_mode',
+        'gen_ai.request.model',
+        'claude.rewind.user_message_id',
+        'claude.task_id',
+        'claude.mcp.server_name',
+    ):
+        assert absent not in s['attributes']
+
+
+@pytest.mark.anyio
+async def test_reconnect_mcp_server_captures_server_name(exporter: TestExporter) -> None:
+    client = _make_dummy_client()
+    await client.reconnect_mcp_server('my-server')
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'mcp.reconnect')
+    assert s['attributes']['claude.mcp.server_name'] == 'my-server'
+
+
+@pytest.mark.anyio
+async def test_toggle_mcp_server_captures_server_name_and_enabled(exporter: TestExporter) -> None:
+    """Multi-arg shape: server_name + enabled both surfaced."""
+    client = _make_dummy_client()
+    await client.toggle_mcp_server('my-server', enabled=False)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    s = next(s for s in spans if s['name'] == 'mcp.toggle')
+    assert s['attributes']['claude.mcp.server_name'] == 'my-server'
+    assert s['attributes']['claude.mcp.enabled'] is False
+
+
+def test_all_lifecycle_and_control_methods_are_wrapped() -> None:
+    """Locks the issue-#11 wrap-every-method contract: every lifecycle and
+    control method on ``ClaudeSDKClient`` carries a ``__wrapped__`` sentinel
+    pointing at the SDK's original implementation. A regression that drops
+    one method's patch (e.g. forgets to add to ``control_method_specs``)
+    silently breaks observability for that surface — the test is the gate.
+
+    The autouse fixture has already instrumented at this point.
+    """
+    cls = ClaudeSDKClient
+    for name in (
+        'connect',
+        'disconnect',
+        'receive_messages',
+        'interrupt',
+        'set_permission_mode',
+        'set_model',
+        'rewind_files',
+        'reconnect_mcp_server',
+        'toggle_mcp_server',
+        'stop_task',
+        # Pre-#11 patches still in place too.
+        'query',
+        'receive_response',
+    ):
+        fn = getattr(cls, name)
+        assert getattr(fn, '__wrapped__', None) is not None, f'{name} should be wrapped'
 
 
 @pytest.mark.anyio
@@ -1724,11 +2034,31 @@ async def test_basic_conversation_cassette(
     assert exporter.exported_spans_as_dict(parse_json_attributes=True) == snapshot(
         [
             {
+                'name': 'connect',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': 1000000000,
+                'end_time': 2000000000,
+                'attributes': {
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_basic_conversation_cassette',
+                    'code.lineno': 123,
+                    'claude.cli_path': IsStr(regex=r'.*/fake_claude\.py$'),
+                    'logfire.msg_template': 'connect',
+                    'logfire.msg': 'connect',
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {'claude.cli_path': {}},
+                    },
+                    'logfire.span_type': 'span',
+                },
+            },
+            {
                 'name': 'chat claude-sonnet-4-6',
-                'context': {'trace_id': 1, 'span_id': 3, 'is_remote': False},
-                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
-                'start_time': 2000000000,
-                'end_time': 3000000000,
+                'context': {'trace_id': 2, 'span_id': 5, 'is_remote': False},
+                'parent': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
+                'start_time': 4000000000,
+                'end_time': 5000000000,
                 'attributes': {
                     'code.filepath': 'test_claude_agent_sdk.py',
                     'code.function': 'test_basic_conversation_cassette',
@@ -1736,28 +2066,31 @@ async def test_basic_conversation_cassette(
                     'gen_ai.operation.name': 'chat',
                     'gen_ai.provider.name': 'anthropic',
                     'gen_ai.system': 'anthropic',
-                    'gen_ai.response.model': 'claude-sonnet-4-6',
-                    'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
-                    'gen_ai.output.messages': [{'role': 'assistant', 'parts': [{'type': 'text', 'content': '4'}]}],
                     'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
+                    'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
+                    'logfire.msg_template': 'chat',
+                    'gen_ai.output.messages': [{'role': 'assistant', 'parts': [{'type': 'text', 'content': '4'}]}],
+                    'logfire.msg': 'chat claude-sonnet-4-6',
+                    'logfire.span_type': 'span',
                     'gen_ai.usage.partial.input_tokens': 9344,
-                    'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.usage.partial.output_tokens': 1,
                     'gen_ai.usage.partial.cache_read.input_tokens': 7166,
                     'gen_ai.usage.partial.cache_creation.input_tokens': 2175,
-                    'logfire.msg_template': 'chat',
-                    'logfire.msg': 'chat claude-sonnet-4-6',
+                    'gen_ai.response.id': 'msg_01BxK8UH2LyuFLVXSPamqHam',
+                    'claude.message.uuid': 'ce1101bc-27c6-41b1-ae16-5edf06b0927c',
+                    'gen_ai.request.model': 'claude-sonnet-4-6',
+                    'gen_ai.response.model': 'claude-sonnet-4-6',
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
                             'gen_ai.operation.name': {},
                             'gen_ai.provider.name': {},
                             'gen_ai.system': {},
-                            'gen_ai.response.model': {},
-                            'gen_ai.system_instructions': {'type': 'array'},
-                            'gen_ai.output.messages': {'type': 'array'},
-                            'gen_ai.request.model': {},
                             'gen_ai.input.messages': {'type': 'array'},
+                            'gen_ai.output.messages': {'type': 'array'},
+                            'gen_ai.system_instructions': {'type': 'array'},
+                            'gen_ai.request.model': {},
+                            'gen_ai.response.model': {},
                             'gen_ai.usage.partial.input_tokens': {},
                             'gen_ai.usage.partial.output_tokens': {},
                             'gen_ai.usage.partial.cache_read.input_tokens': {},
@@ -1766,17 +2099,14 @@ async def test_basic_conversation_cassette(
                             'claude.message.uuid': {},
                         },
                     },
-                    'gen_ai.response.id': 'msg_01BxK8UH2LyuFLVXSPamqHam',
-                    'claude.message.uuid': 'ce1101bc-27c6-41b1-ae16-5edf06b0927c',
-                    'logfire.span_type': 'span',
                 },
             },
             {
                 'name': 'invoke_agent',
-                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'context': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
                 'parent': None,
-                'start_time': 1000000000,
-                'end_time': 4000000000,
+                'start_time': 3000000000,
+                'end_time': 6000000000,
                 'attributes': {
                     'code.filepath': 'test_claude_agent_sdk.py',
                     'code.function': 'test_basic_conversation_cassette',
@@ -1801,6 +2131,7 @@ async def test_basic_conversation_cassette(
                     'duration_api_ms': 2257,
                     'claude.result.subtype': 'success',
                     'claude.result.text': '4',
+                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'claude.model_usage': {
                         'claude-sonnet-4-6': {
                             'inputTokens': 3,
@@ -1813,7 +2144,6 @@ async def test_basic_conversation_cassette(
                             'maxOutputTokens': 32000,
                         }
                     },
-                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
                     'pydantic_ai.all_messages': [
@@ -1840,13 +2170,28 @@ async def test_basic_conversation_cassette(
                             'duration_api_ms': {},
                             'claude.result.subtype': {},
                             'claude.result.text': {},
-                            'claude.model_usage': {'type': 'object'},
                             'gen_ai.response.finish_reasons': {'type': 'array'},
+                            'claude.model_usage': {'type': 'object'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
                             'pydantic_ai.all_messages': {'type': 'array'},
                         },
                     },
+                },
+            },
+            {
+                'name': 'disconnect',
+                'context': {'trace_id': 3, 'span_id': 7, 'is_remote': False},
+                'parent': None,
+                'start_time': 7000000000,
+                'end_time': 8000000000,
+                'attributes': {
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_basic_conversation_cassette',
+                    'code.lineno': 123,
+                    'logfire.msg_template': 'disconnect',
+                    'logfire.span_type': 'span',
+                    'logfire.msg': 'disconnect',
                 },
             },
         ]
@@ -2224,11 +2569,31 @@ async def test_server_tool_blocks_cassette(
     assert exporter.exported_spans_as_dict(parse_json_attributes=True) == snapshot(
         [
             {
+                'name': 'connect',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': 1000000000,
+                'end_time': 2000000000,
+                'attributes': {
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_server_tool_blocks_cassette',
+                    'code.lineno': 123,
+                    'claude.cli_path': IsStr(regex=r'.*/fake_claude\.py$'),
+                    'logfire.msg_template': 'connect',
+                    'logfire.span_type': 'span',
+                    'logfire.msg': 'connect',
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {'claude.cli_path': {}},
+                    },
+                },
+            },
+            {
                 'name': 'chat claude-sonnet-4-6',
-                'context': {'trace_id': 1, 'span_id': 3, 'is_remote': False},
-                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
-                'start_time': 2000000000,
-                'end_time': 3000000000,
+                'context': {'trace_id': 2, 'span_id': 5, 'is_remote': False},
+                'parent': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
+                'start_time': 4000000000,
+                'end_time': 5000000000,
                 'attributes': {
                     'code.filepath': 'test_claude_agent_sdk.py',
                     'code.function': 'test_server_tool_blocks_cassette',
@@ -2239,7 +2604,6 @@ async def test_server_tool_blocks_cassette(
                     'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
                     'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
                     'logfire.msg_template': 'chat',
-                    'logfire.span_type': 'span',
                     'gen_ai.output.messages': [
                         {
                             'role': 'assistant',
@@ -2260,15 +2624,16 @@ async def test_server_tool_blocks_cassette(
                             ],
                         }
                     ],
-                    'gen_ai.request.model': 'claude-sonnet-4-6',
-                    'gen_ai.response.model': 'claude-sonnet-4-6',
                     'logfire.msg': 'chat claude-sonnet-4-6',
+                    'logfire.span_type': 'span',
                     'gen_ai.usage.partial.input_tokens': 9344,
                     'gen_ai.usage.partial.output_tokens': 1,
                     'gen_ai.usage.partial.cache_read.input_tokens': 7166,
                     'gen_ai.usage.partial.cache_creation.input_tokens': 2175,
                     'gen_ai.response.id': 'msg_01SrvToolFixturePpppppppppp',
                     'claude.message.uuid': 'f85bae42-7165-4a5e-991b-68c4fd586f8a',
+                    'gen_ai.request.model': 'claude-sonnet-4-6',
+                    'gen_ai.response.model': 'claude-sonnet-4-6',
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
@@ -2276,8 +2641,8 @@ async def test_server_tool_blocks_cassette(
                             'gen_ai.provider.name': {},
                             'gen_ai.system': {},
                             'gen_ai.input.messages': {'type': 'array'},
-                            'gen_ai.system_instructions': {'type': 'array'},
                             'gen_ai.output.messages': {'type': 'array'},
+                            'gen_ai.system_instructions': {'type': 'array'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
                             'gen_ai.usage.partial.input_tokens': {},
@@ -2292,10 +2657,10 @@ async def test_server_tool_blocks_cassette(
             },
             {
                 'name': 'invoke_agent',
-                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'context': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
                 'parent': None,
-                'start_time': 1000000000,
-                'end_time': 4000000000,
+                'start_time': 3000000000,
+                'end_time': 6000000000,
                 'attributes': {
                     'code.filepath': 'test_claude_agent_sdk.py',
                     'code.function': 'test_server_tool_blocks_cassette',
@@ -2320,6 +2685,7 @@ async def test_server_tool_blocks_cassette(
                     'duration_api_ms': 2257,
                     'claude.result.subtype': 'success',
                     'claude.result.text': '4',
+                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'claude.model_usage': {
                         'claude-sonnet-4-6': {
                             'inputTokens': 3,
@@ -2332,7 +2698,6 @@ async def test_server_tool_blocks_cassette(
                             'maxOutputTokens': 32000,
                         }
                     },
-                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
                     'pydantic_ai.all_messages': [
@@ -2377,14 +2742,29 @@ async def test_server_tool_blocks_cassette(
                             'duration_api_ms': {},
                             'claude.result.subtype': {},
                             'claude.result.text': {},
-                            'claude.model_usage': {'type': 'object'},
                             'gen_ai.response.finish_reasons': {'type': 'array'},
+                            'claude.model_usage': {'type': 'object'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
                             'pydantic_ai.all_messages': {'type': 'array'},
                             'claude.tools_used': {'type': 'array'},
                         },
                     },
+                },
+            },
+            {
+                'name': 'disconnect',
+                'context': {'trace_id': 3, 'span_id': 7, 'is_remote': False},
+                'parent': None,
+                'start_time': 7000000000,
+                'end_time': 8000000000,
+                'attributes': {
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_server_tool_blocks_cassette',
+                    'code.lineno': 123,
+                    'logfire.msg_template': 'disconnect',
+                    'logfire.span_type': 'span',
+                    'logfire.msg': 'disconnect',
                 },
             },
         ]
@@ -2431,11 +2811,31 @@ async def test_ratelimit_and_mirror_error_cassette(
     assert exporter.exported_spans_as_dict(parse_json_attributes=True) == snapshot(
         [
             {
+                'name': 'connect',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': 1000000000,
+                'end_time': 2000000000,
+                'attributes': {
+                    'logfire.span_type': 'span',
+                    'logfire.msg_template': 'connect',
+                    'claude.cli_path': IsStr(regex=r'.*/fake_claude\.py$'),
+                    'logfire.msg': 'connect',
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
+                    'code.lineno': 123,
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {'claude.cli_path': {}},
+                    },
+                },
+            },
+            {
                 'name': 'rate_limit {status}',
-                'context': {'trace_id': 1, 'span_id': 5, 'is_remote': False},
-                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
-                'start_time': 3000000000,
-                'end_time': 3000000000,
+                'context': {'trace_id': 2, 'span_id': 7, 'is_remote': False},
+                'parent': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
+                'start_time': 5000000000,
+                'end_time': 5000000000,
                 'attributes': {
                     'logfire.span_type': 'log',
                     'logfire.level_num': 13,
@@ -2472,54 +2872,58 @@ async def test_ratelimit_and_mirror_error_cassette(
             },
             {
                 'name': 'mirror store error: {error}',
-                'context': {'trace_id': 1, 'span_id': 6, 'is_remote': False},
-                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
-                'start_time': 4000000000,
-                'end_time': 4000000000,
+                'context': {'trace_id': 2, 'span_id': 8, 'is_remote': False},
+                'parent': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
+                'start_time': 6000000000,
+                'end_time': 6000000000,
                 'attributes': {
-                    'logfire.span_type': 'log',
-                    'logfire.level_num': 17,
-                    'logfire.msg_template': 'mirror store error: {error}',
-                    'logfire.msg': 'mirror store error: store append timed out',
                     'code.filepath': 'test_claude_agent_sdk.py',
+                    'logfire.level_num': 17,
                     'code.function': 'test_ratelimit_and_mirror_error_cassette',
                     'code.lineno': 123,
                     'error': 'store append timed out',
                     'error.type': 'MirrorError',
                     'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
+                    'logfire.msg_template': 'mirror store error: {error}',
+                    'logfire.span_type': 'log',
+                    'logfire.msg': 'mirror store error: store append timed out',
                     'logfire.json_schema': {
                         'type': 'object',
-                        'properties': {'error': {}, 'error.type': {}, 'gen_ai.conversation.id': {}},
+                        'properties': {
+                            'error': {},
+                            'error.type': {},
+                            'gen_ai.conversation.id': {},
+                        },
                     },
                 },
             },
             {
                 'name': 'chat claude-sonnet-4-6',
-                'context': {'trace_id': 1, 'span_id': 3, 'is_remote': False},
-                'parent': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
-                'start_time': 2000000000,
-                'end_time': 5000000000,
+                'context': {'trace_id': 2, 'span_id': 5, 'is_remote': False},
+                'parent': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
+                'start_time': 4000000000,
+                'end_time': 7000000000,
                 'attributes': {
                     'code.filepath': 'test_claude_agent_sdk.py',
                     'code.function': 'test_ratelimit_and_mirror_error_cassette',
-                    'code.lineno': 123,
                     'gen_ai.operation.name': 'chat',
                     'gen_ai.provider.name': 'anthropic',
                     'gen_ai.system': 'anthropic',
                     'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
                     'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
-                    'logfire.msg_template': 'chat',
-                    'logfire.span_type': 'span',
+                    'code.lineno': 123,
                     'gen_ai.output.messages': [{'role': 'assistant', 'parts': [{'type': 'text', 'content': '4'}]}],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
-                    'logfire.msg': 'chat claude-sonnet-4-6',
                     'gen_ai.usage.partial.input_tokens': 9344,
                     'gen_ai.usage.partial.output_tokens': 1,
                     'gen_ai.usage.partial.cache_read.input_tokens': 7166,
                     'gen_ai.usage.partial.cache_creation.input_tokens': 2175,
                     'gen_ai.response.id': 'msg_01BxK8UH2LyuFLVXSPamqHam',
                     'claude.message.uuid': 'ce1101bc-27c6-41b1-ae16-5edf06b0927c',
+                    'logfire.msg_template': 'chat',
+                    'logfire.msg': 'chat claude-sonnet-4-6',
+                    'logfire.span_type': 'span',
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
@@ -2543,34 +2947,34 @@ async def test_ratelimit_and_mirror_error_cassette(
             },
             {
                 'name': 'invoke_agent',
-                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'context': {'trace_id': 2, 'span_id': 3, 'is_remote': False},
                 'parent': None,
-                'start_time': 1000000000,
-                'end_time': 6000000000,
+                'start_time': 3000000000,
+                'end_time': 8000000000,
                 'attributes': {
-                    'code.filepath': 'test_claude_agent_sdk.py',
-                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
-                    'code.lineno': 123,
+                    'logfire.span_type': 'span',
+                    'logfire.msg_template': 'invoke_agent',
                     'gen_ai.operation.name': 'invoke_agent',
                     'gen_ai.provider.name': 'anthropic',
                     'gen_ai.system': 'anthropic',
                     'gen_ai.agent.name': 'claude-code',
                     'gen_ai.input.messages': [{'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]}],
                     'gen_ai.system_instructions': [{'type': 'text', 'content': 'Be helpful'}],
-                    'logfire.msg_template': 'invoke_agent',
                     'logfire.msg': 'invoke_agent',
-                    'logfire.span_type': 'span',
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
                     'gen_ai.usage.input_tokens': 9344,
                     'gen_ai.usage.output_tokens': 5,
                     'gen_ai.usage.cache_read.input_tokens': 7166,
                     'gen_ai.usage.cache_creation.input_tokens': 2175,
                     'operation.cost': 0.01039005,
-                    'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
+                    'code.lineno': 123,
                     'num_turns': 1,
                     'duration_ms': 2263,
                     'duration_api_ms': 2257,
                     'claude.result.subtype': 'success',
                     'claude.result.text': '4',
+                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'claude.model_usage': {
                         'claude-sonnet-4-6': {
                             'inputTokens': 3,
@@ -2583,13 +2987,13 @@ async def test_ratelimit_and_mirror_error_cassette(
                             'maxOutputTokens': 32000,
                         }
                     },
-                    'gen_ai.response.finish_reasons': ['end_turn'],
                     'gen_ai.request.model': 'claude-sonnet-4-6',
                     'gen_ai.response.model': 'claude-sonnet-4-6',
                     'pydantic_ai.all_messages': [
                         {'role': 'user', 'parts': [{'type': 'text', 'content': 'What is 2+2?'}]},
                         {'role': 'assistant', 'parts': [{'type': 'text', 'content': '4'}]},
                     ],
+                    'gen_ai.conversation.id': '7ed3c21d-374b-491a-8c66-05e191f6a0be',
                     'logfire.json_schema': {
                         'type': 'object',
                         'properties': {
@@ -2610,13 +3014,28 @@ async def test_ratelimit_and_mirror_error_cassette(
                             'duration_api_ms': {},
                             'claude.result.subtype': {},
                             'claude.result.text': {},
-                            'claude.model_usage': {'type': 'object'},
                             'gen_ai.response.finish_reasons': {'type': 'array'},
+                            'claude.model_usage': {'type': 'object'},
                             'gen_ai.request.model': {},
                             'gen_ai.response.model': {},
                             'pydantic_ai.all_messages': {'type': 'array'},
                         },
                     },
+                },
+            },
+            {
+                'name': 'disconnect',
+                'context': {'trace_id': 3, 'span_id': 9, 'is_remote': False},
+                'parent': None,
+                'start_time': 9000000000,
+                'end_time': 10000000000,
+                'attributes': {
+                    'code.filepath': 'test_claude_agent_sdk.py',
+                    'code.function': 'test_ratelimit_and_mirror_error_cassette',
+                    'code.lineno': 123,
+                    'logfire.msg_template': 'disconnect',
+                    'logfire.span_type': 'span',
+                    'logfire.msg': 'disconnect',
                 },
             },
         ]

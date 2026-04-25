@@ -110,6 +110,26 @@ The `Hook:` prefix is a deliberate UX choice for trace readability — it makes 
 
 `PreToolUse` hooks can return `updatedInput` to mutate a tool's arguments before execution; the same applies to `can_use_tool`'s `PermissionResultAllow.updated_input`. When this happens between `pre_tool_use_hook` and execution, the integration overwrites `gen_ai.tool.call.arguments` on the `execute_tool` span with the executed (post-mutation) value — matching the OTel Gen AI semconv expectation that `arguments` reflects what the tool actually saw — and surfaces the original (pre-hook) value under `claude.tool_call.arguments.original`. The diff attribute is absent on the common path where no hook mutated the input, so happy-path spans stay noise-free. Both attributes carry caller-supplied data and remain subject to the default scrubber.
 
+## Lifecycle and control-method spans
+
+`ClaudeSDKClient`'s lifecycle entry/exit and mid-session control methods are wrapped in spans so startup latency, model switches, and MCP toggles are visible — none of these were traced before:
+
+- **`connect`** — spans the CLI subprocess launch and `Query.initialize` handshake. Carries `claude.cli_path` when set in `ClaudeAgentOptions`. On `CLINotFoundError` / `CLIConnectionError` / `ProcessError`, the span is escalated to error level with `error.type` (short class name) and, for `ProcessError` specifically, `claude.process.exit_code` and `claude.process.stderr` (truncated to the first 200 characters). Logfire's automatic exception recording also attaches the full traceback under `exception_type` / `exception.stacktrace` separately, so the audit trail is complete.
+- **`disconnect`** — spans subprocess teardown. The SDK's `connect()` calls `disconnect()` from its own except cleanup on failure; that nested invocation produces a child `disconnect` span under the failed `connect`.
+- **`set_model`** — captures the requested model under `gen_ai.request.model`. Mid-session model switches were previously invisible, breaking cost attribution when the active model differed from `ClaudeAgentOptions.model`. The attribute is absent when `set_model(None)` is called to revert to the default.
+- **`set_permission_mode`** — captures the new mode under `claude.permission_mode` (the same attribute name used by the options-side capture from #8).
+- **`rewind_files`** — captures `claude.rewind.user_message_id`.
+- **`stop_task`** — captures `claude.task_id`.
+- **`interrupt`** — timing only, no input attributes.
+- **`mcp.reconnect`** / **`mcp.toggle`** — both carry `claude.mcp.server_name`; `mcp.toggle` additionally carries `claude.mcp.enabled`. The `mcp.` prefix groups MCP sub-domain operations distinctly from session-lifecycle calls in dashboards.
+
+These spans are top-level (no `invoke_agent` parent) when called between turns; if a control method is invoked from inside an active `receive_response` / `receive_messages` iteration (e.g. from a hook callback), it nests under the active `invoke_agent` via the existing thread-local OTel context.
+
+`receive_messages` (the alternate iterator to `receive_response`) now produces the same `invoke_agent` / `chat` / `Hook: *` span tree as `receive_response`. Sessions using `receive_messages` were previously a complete observability black hole; the integration internally factors a shared lifecycle so both iterators produce identical traces.
+
+!!! note "`receive_messages` and the break-without-aclose edge case"
+    `receive_messages` has no auto-stop sentinel, so the user must `break` to leave the loop. If the loop breaks without explicitly calling `await iter.aclose()` or using `async with closing(...)`, Python may not run the wrapper's `finally` block immediately — the OTel context for `invoke_agent` stays active until garbage collection runs, and any operations called between break and aclose (including `__aexit__`'s implicit `disconnect`) will parent to the stale `invoke_agent`. Doesn't affect `receive_response` (which auto-stops cleanly at `ResultMessage`). For `receive_messages`, prefer `async with contextlib.aclosing(client.receive_messages()) as it: ...` if you break early.
+
 ## End-of-conversation result fields
 
 The `invoke_agent` span carries the conversation-level summary extracted from `ResultMessage`:
