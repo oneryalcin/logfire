@@ -62,6 +62,11 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_PERMISSION_REQUEST_COUNT,
     CLAUDE_PERMISSION_REQUEST_SUGGESTIONS,
     CLAUDE_PERMISSION_REQUEST_TOOL_INPUT,
+    CLAUDE_PERMISSION_RESULT_BEHAVIOR,
+    CLAUDE_PERMISSION_RESULT_INTERRUPT,
+    CLAUDE_PERMISSION_RESULT_MESSAGE,
+    CLAUDE_PERMISSION_RESULT_UPDATED_INPUT,
+    CLAUDE_PERMISSION_RESULT_UPDATED_PERMISSIONS,
     CLAUDE_RESULT_ERRORS,
     CLAUDE_RESULT_STRUCTURED_OUTPUT,
     CLAUDE_RESULT_SUBTYPE,
@@ -72,6 +77,7 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_SKILLS_MODE,
     CLAUDE_STOP_HOOK_ACTIVE,
     CLAUDE_STOP_LAST_ASSISTANT_MESSAGE,
+    CLAUDE_TOOL_CALL_ARGUMENTS_ORIGINAL,
     CLAUDE_TOOLS_USED,
     CLAUDE_USER_PROMPT,
     CLAUDE_USER_PROMPT_COUNT,
@@ -331,6 +337,10 @@ async def pre_tool_use_hook(
     _context: HookContext,
 ) -> SyncHookJSONOutput:
     """Create a child span when a tool execution starts."""
+    # Truthy-check covers ``None`` *and* empty string. The SDK declares
+    # ``tool_use_id: str | None`` and an empty string would silently skip
+    # both the span open and the issue-#10 diff snapshot — acceptable
+    # because there's no way to correlate a tool call without an id anyway.
     if not tool_use_id:
         return {}
 
@@ -365,6 +375,17 @@ async def pre_tool_use_hook(
             )
             span._start()  # pyright: ignore[reportPrivateUsage]
             state.active_tool_spans[tool_use_id] = span
+            # Snapshot for issue #10's pre-vs-executed input diff. Only kept
+            # when the input is dict-shaped — non-dict shapes (rare/malformed)
+            # would compare unreliably and aren't worth the diff.
+            # Shallow ``dict(...)`` copy is sufficient because the SDK
+            # round-trips ``tool_input`` through JSON at the control-protocol
+            # boundary, so nested dicts are fresh on each callback. If a
+            # future SDK refactor bypasses JSON (e.g. for in-process MCP),
+            # nested-dict mutations would silently miss the diff — revisit
+            # with ``copy.deepcopy`` then.
+            if isinstance(tool_input, dict):
+                state.original_tool_inputs[tool_use_id] = dict(tool_input)
         finally:
             context_api.detach(token)
 
@@ -386,8 +407,26 @@ async def post_tool_use_hook(
             return {}
 
         span = state.active_tool_spans.pop(tool_use_id, None)
+        # Consume the issue-#10 pre-hook input snapshot (None if the
+        # snapshot path skipped — see ``pre_tool_use_hook`` for the
+        # shallow-copy / dict-shape gate).
+        original_input = state.original_tool_inputs.pop(tool_use_id, None)
         if not span:  # pragma: no cover
             return {}
+
+        # Issue #10: a hook (PreToolUse output ``updatedInput`` or
+        # ``can_use_tool``'s ``PermissionResultAllow.updated_input``) may have
+        # mutated the input between pre and execute. Overwrite the OTel-
+        # canonical attribute with the executed value and surface the
+        # original under ``claude.tool_call.arguments.original``.
+        executed_input = input_data.get('tool_input')
+        if (
+            isinstance(executed_input, dict)
+            and isinstance(original_input, dict)
+            and executed_input != original_input
+        ):
+            span.set_attribute(TOOL_CALL_ARGUMENTS, executed_input)
+            span.set_attribute(CLAUDE_TOOL_CALL_ARGUMENTS_ORIGINAL, original_input)
 
         tool_response = input_data.get('tool_response')
         if tool_response is not None:
@@ -416,6 +455,9 @@ async def post_tool_use_failure_hook(
             return {}
 
         span = state.active_tool_spans.pop(tool_use_id, None)
+        # Discard any pre-hook input snapshot kept by issue #10's diff path
+        # (no executed input on failure, no diff to surface).
+        state.original_tool_inputs.pop(tool_use_id, None)
         if not span:  # pragma: no cover
             return {}
 
@@ -468,6 +510,11 @@ async def _run_hook(
     span's OTel context (hooks run in different anyio tasks so contextvars
     don't propagate; without explicit attach the emitted log lands as an
     orphan top-level span rather than nested under ``invoke_agent``).
+
+    Issue #10's ``_wrap_can_use_tool`` deliberately does NOT use this
+    helper — its shape is ``await user_callback() -> emit -> return result``
+    (await-then-emit, with the user-supplied result threaded back to the
+    SDK), whereas this helper is pure emission.
     """
     with handle_internal_errors:
         state = _get_state()
@@ -678,10 +725,11 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
 
 
 def _inject_tracing_hooks(options: Any) -> None:
-    """Inject logfire tracing hooks into ClaudeAgentOptions.
+    """Inject logfire tracing hooks into ClaudeAgentOptions and wrap any
+    ``can_use_tool`` callback for outcome tracing (issue #10).
 
-    Guards against duplicate injection when the same options object is reused
-    across multiple ClaudeSDKClient instances.
+    Guards against duplicate injection / double-wrap when the same options
+    object is reused across multiple ClaudeSDKClient instances.
     """
     if not hasattr(options, 'hooks'):
         return
@@ -714,6 +762,13 @@ def _inject_tracing_hooks(options: Any) -> None:
             hooks.setdefault(event, [])
             hooks[event].insert(0, HookMatcher(matcher=None, hooks=[callback]))
 
+        # Wrap can_use_tool (issue #10). The user's callback is opt-in
+        # (None for most users); only wrap when set so we don't inject a
+        # callback the SDK would otherwise treat as a feature toggle.
+        callback = getattr(options, 'can_use_tool', None)
+        if callback is not None:
+            options.can_use_tool = _wrap_can_use_tool(callback)
+
 
 class _ConversationState:
     """Per-conversation state stored in thread-local during a receive_response iteration.
@@ -734,6 +789,10 @@ class _ConversationState:
         self.logfire = logfire
         self.root_span = root_span
         self.active_tool_spans: dict[str, LogfireSpan] = {}
+        # Tool input as seen by ``pre_tool_use_hook`` keyed by ``tool_use_id``.
+        # ``post_tool_use_hook`` consumes it to detect updatedInput mutations
+        # (issue #10). Cleared on consumption to bound size.
+        self.original_tool_inputs: dict[str, Any] = {}
         self._current_span: LogfireSpan | None = None
         # Running conversation history — each chat span gets the full history as input.
         self._history: list[ChatMessage] = list(input_messages)
@@ -1139,3 +1198,129 @@ def _record_permission_request(state: _ConversationState, input_data: Any) -> No
         tool_name=attrs.get(TOOL_NAME, ''),
         **attrs,
     )
+
+
+def _record_permission_result(
+    state: _ConversationState,
+    tool_name: str,
+    tool_use_id: str | None,
+    result: Any,
+) -> None:
+    """Record a ``can_use_tool`` outcome (issue #10).
+
+    Signature deliberately diverges from the issue-#9 ``_record_*`` helpers'
+    ``(state, input_data)`` shape — this helper is invoked from
+    ``_wrap_can_use_tool`` (a non-hook async callback wrapper, not a hook
+    callback) and the source data is a typed ``PermissionResult`` dataclass
+    rather than a hook JSON dict. Mapping the dataclass into ``input_data``
+    just to fit the convention would obscure the typed contract.
+
+    Pairs with the request-side ``Hook: PermissionRequest`` log from #9 —
+    this captures what the user's ``can_use_tool`` callback decided, not
+    just that the CLI asked. Shape:
+
+    - **Allow** → info log; surfaces ``updated_input`` / ``updated_permissions``
+      only when the callback mutated either, so happy-path Allow logs stay
+      attribute-free beyond the behavior + tool_name.
+    - **Deny** → warn log; surfaces ``message`` and ``interrupt`` (when True).
+      Also escalates the still-open ``execute_tool`` span (the existing
+      ``pre_tool_use_hook`` opens it before ``can_use_tool`` fires; deny
+      aborts execution so ``post_tool_use_hook`` never runs and
+      ``state.close()`` would otherwise end the span as a silent orphan).
+      The level escalation + ``error.type='PermissionDeny'`` keeps the
+      denied call visible mid-conversation, not just in the
+      session-aggregate ``claude.permission_denials``.
+
+    Per-attribute SAFE_KEYS rationale: see semconv.py — none of the new
+    ``claude.permission_result.*`` attrs are allowlisted; default scrubbing
+    is the safer posture for caller-supplied data.
+    """
+    behavior = getattr(result, 'behavior', None)
+    attrs: dict[str, Any] = {
+        TOOL_NAME: tool_name,
+        CLAUDE_PERMISSION_RESULT_BEHAVIOR: behavior or 'unknown',
+    }
+    if tool_use_id is not None:
+        attrs[TOOL_CALL_ID] = tool_use_id
+
+    if isinstance(result, claude_agent_sdk.PermissionResultDeny):
+        message = getattr(result, 'message', '')
+        if message:
+            attrs[CLAUDE_PERMISSION_RESULT_MESSAGE] = message
+        if getattr(result, 'interrupt', False):
+            attrs[CLAUDE_PERMISSION_RESULT_INTERRUPT] = True
+        # Escalate AND immediately end the open ``execute_tool`` span. Deny
+        # aborts execution before PostToolUse fires, so without ending the
+        # span here it would stay open until ``state.close()`` runs at
+        # end-of-conversation — producing a misleading ``end_time`` /
+        # ``duration_ms`` that spans the entire remaining session for
+        # every denied call.
+        if tool_use_id is not None and (open_span := state.active_tool_spans.pop(tool_use_id, None)):
+            open_span.set_attribute(ERROR_TYPE, 'PermissionDeny')
+            if message:
+                open_span.set_attribute(CLAUDE_PERMISSION_RESULT_MESSAGE, message)
+            open_span.set_level('warn')
+            open_span._end()  # pyright: ignore[reportPrivateUsage]
+            # Also drop the diff snapshot — no PostToolUse will arrive to
+            # consume it, and leaving it would leak across sessions.
+            state.original_tool_inputs.pop(tool_use_id, None)
+        state.logfire.warn('Hook: PermissionResult ({behavior})', behavior='deny', **attrs)
+        return
+
+    if isinstance(result, claude_agent_sdk.PermissionResultAllow):
+        if (updated_input := getattr(result, 'updated_input', None)) is not None:
+            attrs[CLAUDE_PERMISSION_RESULT_UPDATED_INPUT] = updated_input
+        if (updated_permissions := getattr(result, 'updated_permissions', None)) is not None:
+            # ``updated_permissions`` is a list of PermissionUpdate dataclasses;
+            # serialise via ``.to_dict()`` (mirrors what the SDK does at the
+            # wire boundary in query.py).
+            try:
+                attrs[CLAUDE_PERMISSION_RESULT_UPDATED_PERMISSIONS] = [
+                    p.to_dict() if hasattr(p, 'to_dict') else p
+                    for p in updated_permissions
+                ]
+            except Exception:  # pragma: no cover  # forward-compat: skip bad shape
+                pass
+        state.logfire.info('Hook: PermissionResult ({behavior})', behavior='allow', **attrs)
+        return
+
+    # Unknown PermissionResult subtype — log defensively under warn so a
+    # future SDK change doesn't silently lose audit signal.
+    state.logfire.warn('Hook: PermissionResult ({behavior})', behavior='unknown', **attrs)
+
+
+def _wrap_can_use_tool(callback: Any) -> Any:
+    """Wrap a user-supplied ``can_use_tool`` callback so each invocation is
+    surfaced as a logfire log under the active ``invoke_agent`` span.
+
+    Idempotent: calling on an already-wrapped callable is a no-op (returns
+    the same wrapper). Used by ``_inject_tracing_hooks`` to avoid double-
+    wrap when the same options object is reused across multiple
+    ``ClaudeSDKClient`` instances.
+    """
+    if getattr(callback, '_logfire_wrapped', False):
+        return callback
+
+    @functools.wraps(callback)
+    async def wrapped(tool_name: str, tool_input: Any, context: Any) -> Any:
+        result = await callback(tool_name, tool_input, context)
+        with handle_internal_errors:
+            state = _get_state()
+            if state is None:  # pragma: no cover
+                return result
+            token = _attach_root_context(state)
+            if token is None:  # pragma: no cover
+                return result
+            try:
+                _record_permission_result(
+                    state,
+                    tool_name=tool_name,
+                    tool_use_id=getattr(context, 'tool_use_id', None),
+                    result=result,
+                )
+            finally:
+                context_api.detach(token)
+        return result
+
+    wrapped._logfire_wrapped = True  # type: ignore[attr-defined]
+    return wrapped

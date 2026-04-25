@@ -210,6 +210,31 @@ CLAUDE_PERMISSION_REQUEST_COUNT = 'claude.permission_request_count'
 CLAUDE_AGENT_ID = 'claude.agent_id'
 CLAUDE_AGENT_TYPE = 'claude.agent_type'
 
+# Permission-flow attributes (issue #10). Pair with the request-side
+# ``claude.permission_request.*`` from #9: the *outcome* lives here.
+#
+# - ``behavior`` is ``"allow"`` / ``"deny"`` (the SDK's PermissionResult enum).
+# - ``message`` and ``interrupt`` are populated only on ``PermissionResultDeny``.
+# - ``updated_input`` / ``updated_permissions`` are populated only on
+#   ``PermissionResultAllow`` when the user callback mutated either.
+#
+# Deliberately NOT on SAFE_KEYS: ``updated_input`` is caller-supplied
+# arbitrary data, ``message`` is operator-set (could echo any string).
+# Default scrubbing is the safer privacy posture, mirroring
+# ``claude.permission_denials`` and ``claude.permission_request.*``.
+CLAUDE_PERMISSION_RESULT_BEHAVIOR = 'claude.permission_result.behavior'
+CLAUDE_PERMISSION_RESULT_MESSAGE = 'claude.permission_result.message'
+CLAUDE_PERMISSION_RESULT_INTERRUPT = 'claude.permission_result.interrupt'
+CLAUDE_PERMISSION_RESULT_UPDATED_INPUT = 'claude.permission_result.updated_input'
+CLAUDE_PERMISSION_RESULT_UPDATED_PERMISSIONS = 'claude.permission_result.updated_permissions'
+
+# When a hook (PreToolUse output ``updatedInput`` or ``can_use_tool``'s
+# ``PermissionResultAllow.updated_input``) mutates a tool's input between
+# pre- and post-hook fire, the OTel-canonical ``gen_ai.tool.call.arguments``
+# is overwritten with the executed (post) value and the original (pre)
+# value lands here. Absent on the happy path where pre == executed.
+CLAUDE_TOOL_CALL_ARGUMENTS_ORIGINAL = 'claude.tool_call.arguments.original'
+
 # Type definitions for message parts and messages
 
 

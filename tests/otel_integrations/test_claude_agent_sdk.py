@@ -31,6 +31,8 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ServerToolResultBlock,
     ServerToolUseBlock,
     TextBlock,
@@ -53,12 +55,14 @@ from logfire._internal.integrations.claude_agent_sdk import (
     _record_mirror_error,
     _record_notification,
     _record_permission_request,
+    _record_permission_result,
     _record_pre_compact,
     _record_rate_limit_event,
     _record_result,
     _record_stop,
     _record_user_prompt_submit,
     _set_state,
+    _wrap_can_use_tool,
     notification_hook,
     permission_request_hook,
     post_tool_use_failure_hook,
@@ -1330,6 +1334,361 @@ async def test_hook_callbacks_attach_to_root_span_context(exporter: TestExporter
     for log_name in ('Hook: UserPromptSubmit', 'Hook: Stop'):
         log = next(s for s in spans if s['name'] == log_name)
         assert log['parent']['span_id'] == root_id, f'{log_name} should be parented to invoke_agent'
+
+
+# ---------------------------------------------------------------------------
+# Permission-flow tests (issue #10).
+#
+# Three sub-gaps locked in this block: PreToolUse ``updatedInput`` diff,
+# ``can_use_tool`` outcome capture, and the deny escalation on the open
+# ``execute_tool`` span. Driven through public-API helpers + ``HookContext``
+# / ``ToolPermissionContext`` shims so tests don't depend on a live SDK
+# control-protocol session.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_post_tool_use_overwrites_arguments_when_input_mutated(exporter: TestExporter) -> None:
+    """A user PreToolUse hook (or ``can_use_tool.updated_input``) that
+    mutates ``tool_input`` between pre and execute → ``post_tool_use_hook``
+    overwrites ``gen_ai.tool.call.arguments`` with the executed value AND
+    surfaces the pre value under ``claude.tool_call.arguments.original``.
+
+    Locks the OTel-canonical "arguments seen by the tool" semantic for
+    the canonical attribute, with the diff captured side-by-side.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    ctx: HookContext = {'signal': None}
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            # Pre fires with original input.
+            await pre_tool_use_hook(
+                {'tool_name': 'Bash', 'tool_input': {'command': 'echo hi'}, 'tool_use_id': 'tool_m'},
+                'tool_m',
+                ctx,
+            )
+            # Post fires with mutated input — simulates a user PreToolUse hook
+            # having returned ``updatedInput`` between us and execution.
+            await post_tool_use_hook(
+                {
+                    'tool_name': 'Bash',
+                    'tool_input': {'command': 'echo hi # appended'},
+                    'tool_response': 'hi # appended\n',
+                    'tool_use_id': 'tool_m',
+                },
+                'tool_m',
+                ctx,
+            )
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    tool_span = next(s for s in spans if s['name'] == 'execute_tool Bash')
+    # Canonical attribute now reflects the executed (post) value.
+    assert tool_span['attributes']['gen_ai.tool.call.arguments'] == {'command': 'echo hi # appended'}
+    # Pre value preserved under the diff attribute.
+    assert tool_span['attributes']['claude.tool_call.arguments.original'] == {'command': 'echo hi'}
+
+
+@pytest.mark.anyio
+async def test_post_tool_use_no_extra_attr_when_input_unchanged(exporter: TestExporter) -> None:
+    """Happy path: pre and executed inputs match → ``claude.tool_call.arguments.original``
+    is NOT emitted. Keeps the trace noise-free for the common case where no
+    hook mutated the input.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    ctx: HookContext = {'signal': None}
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            await pre_tool_use_hook(
+                {'tool_name': 'Read', 'tool_input': {'path': '/tmp/foo'}, 'tool_use_id': 'tool_u'},
+                'tool_u',
+                ctx,
+            )
+            await post_tool_use_hook(
+                {
+                    'tool_name': 'Read',
+                    'tool_input': {'path': '/tmp/foo'},
+                    'tool_response': 'contents',
+                    'tool_use_id': 'tool_u',
+                },
+                'tool_u',
+                ctx,
+            )
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    tool_span = next(s for s in spans if s['name'] == 'execute_tool Read')
+    assert 'claude.tool_call.arguments.original' not in tool_span['attributes']
+    # Canonical attribute unchanged (pre == executed).
+    assert tool_span['attributes']['gen_ai.tool.call.arguments'] == {'path': '/tmp/foo'}
+
+
+@pytest.mark.anyio
+async def test_post_tool_use_failure_clears_original_input_snapshot() -> None:
+    """The failure path must also pop ``state.original_tool_inputs`` so
+    long-running clients with many failed tool calls don't leak the snapshot
+    dict indefinitely.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    ctx: HookContext = {'signal': None}
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            await pre_tool_use_hook(
+                {'tool_name': 'Write', 'tool_input': {'path': '/x'}, 'tool_use_id': 'tool_f'},
+                'tool_f',
+                ctx,
+            )
+            assert 'tool_f' in state.original_tool_inputs
+            await post_tool_use_failure_hook(
+                {'tool_name': 'Write', 'tool_input': {'path': '/x'}, 'error': 'boom', 'tool_use_id': 'tool_f'},
+                'tool_f',
+                ctx,
+            )
+            assert 'tool_f' not in state.original_tool_inputs
+        finally:
+            _clear_state()
+
+
+@pytest.mark.anyio
+async def test_record_permission_result_allow_with_mutation_logs_updated_input(exporter: TestExporter) -> None:
+    """A ``can_use_tool`` Allow that returns a non-None ``updated_input`` /
+    ``updated_permissions`` surfaces both on the log. Plain Allow (no
+    mutation) is covered separately."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        result = PermissionResultAllow(updated_input={'command': 'echo MUTATED'})
+        _record_permission_result(state, tool_name='Bash', tool_use_id='t1', result=result)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(
+        s for s in spans
+        if s['name'] == 'Hook: PermissionResult ({behavior})'
+        and s['attributes'].get('claude.permission_result.behavior') == 'allow'
+    )
+    assert log['attributes']['claude.permission_result.behavior'] == 'allow'
+    assert log['attributes']['gen_ai.tool.name'] == 'Bash'
+    assert log['attributes']['claude.permission_result.updated_input'] == {'command': 'echo MUTATED'}
+    assert log['attributes']['logfire.level_num'] == 9  # info
+
+
+@pytest.mark.anyio
+async def test_record_permission_result_allow_plain_skips_updated_attrs(exporter: TestExporter) -> None:
+    """Plain ``PermissionResultAllow()`` (no mutation) → no
+    ``claude.permission_result.updated_input`` / ``updated_permissions``
+    attributes. Keeps happy-path Allow logs minimal."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_permission_result(state, tool_name='Read', tool_use_id='t2', result=PermissionResultAllow())
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(
+        s for s in spans
+        if s['name'] == 'Hook: PermissionResult ({behavior})'
+        and s['attributes'].get('claude.permission_result.behavior') == 'allow'
+    )
+    for absent in (
+        'claude.permission_result.updated_input',
+        'claude.permission_result.updated_permissions',
+    ):
+        assert absent not in log['attributes']
+
+
+@pytest.mark.anyio
+async def test_record_permission_result_deny_ends_open_execute_tool_span_promptly(exporter: TestExporter) -> None:
+    """Locks the most subtle invariant of #10: deny aborts execution before
+    PostToolUse fires, leaving an open ``execute_tool`` span. The wrapper
+    has to (a) look up that span via ``state.active_tool_spans``, (b) mark
+    it ``error.type='PermissionDeny'`` + level=warn + the deny message,
+    AND (c) immediately ``pop`` and ``_end`` it.
+
+    The "end promptly" part is the bit that's easy to forget — without it
+    the span sits open until ``state.close()`` runs at end-of-conversation,
+    producing an end_time that lands at session close and a ``duration_ms``
+    that spans the entire remaining session for every denied call. Every
+    dashboard / alert keyed off span duration would silently break.
+
+    Asserts: span has both end_time set AND the right attrs, AND no longer
+    appears in ``state.active_tool_spans``. Pop also clears the issue-#10
+    diff snapshot (no PostToolUse will arrive to consume it).
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        # Mimic ``pre_tool_use_hook`` having opened the execute_tool span
+        # AND populated the diff snapshot — both should be cleaned up.
+        tool_span = logfire_instance.span('execute_tool WebFetch')
+        tool_span._start()  # type: ignore[attr-defined]
+        state.active_tool_spans['t3'] = tool_span
+        state.original_tool_inputs['t3'] = {'url': 'https://example.com/'}
+        _record_permission_result(
+            state,
+            tool_name='WebFetch',
+            tool_use_id='t3',
+            result=PermissionResultDeny(message='blocked by policy', interrupt=False),
+        )
+        # Helper pops both bookkeeping dicts.
+        assert 't3' not in state.active_tool_spans
+        assert 't3' not in state.original_tool_inputs
+        # Span end was triggered by the helper, not by ``state.close()``.
+        # ``_end`` is idempotent so a later ``state.close()`` is harmless.
+        assert tool_span._span is not None  # type: ignore[attr-defined]
+        assert tool_span._span.end_time is not None  # type: ignore[attr-defined]
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    tool = next(s for s in spans if s['name'] == 'execute_tool WebFetch')
+    assert tool['attributes']['error.type'] == 'PermissionDeny'
+    assert tool['attributes']['claude.permission_result.message'] == 'blocked by policy'
+    assert tool['attributes']['logfire.level_num'] == 13  # warn
+
+    log = next(s for s in spans if s['name'].startswith('Hook: PermissionResult'))
+    assert log['attributes']['claude.permission_result.behavior'] == 'deny'
+    assert log['attributes']['claude.permission_result.message'] == 'blocked by policy'
+    # ``interrupt=False`` → attribute skipped (only emit when truthy).
+    assert 'claude.permission_result.interrupt' not in log['attributes']
+    assert log['attributes']['logfire.level_num'] == 13  # warn
+
+
+@pytest.mark.anyio
+async def test_record_permission_result_deny_with_no_open_span(exporter: TestExporter) -> None:
+    """Defensive: if ``can_use_tool`` somehow fires without a matching open
+    ``execute_tool`` span (SDK refactors the call order, edge cases with
+    parallel tool calls), the deny log still emits cleanly without
+    crashing on the missing span lookup."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_permission_result(
+            state,
+            tool_name='WebFetch',
+            tool_use_id='nonexistent',
+            result=PermissionResultDeny(message='no'),
+        )
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(
+        s for s in spans
+        if s['name'] == 'Hook: PermissionResult ({behavior})'
+        and s['attributes'].get('claude.permission_result.behavior') == 'deny'
+    )
+    assert log['attributes']['claude.permission_result.message'] == 'no'
+
+
+@pytest.mark.anyio
+async def test_record_permission_result_deny_with_interrupt_true(exporter: TestExporter) -> None:
+    """``interrupt=True`` is the rare-but-relevant variant — emit the attr
+    only in this case so happy-path deny logs stay minimal."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_permission_result(
+            state,
+            tool_name='WebFetch',
+            tool_use_id='t4',
+            result=PermissionResultDeny(message='abort', interrupt=True),
+        )
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(
+        s for s in spans
+        if s['name'] == 'Hook: PermissionResult ({behavior})'
+        and s['attributes'].get('claude.permission_result.behavior') == 'deny'
+    )
+    assert log['attributes']['claude.permission_result.interrupt'] is True
+
+
+@pytest.mark.anyio
+async def test_wrap_can_use_tool_idempotent_and_passthrough() -> None:
+    """``_wrap_can_use_tool`` must:
+
+    - return the same wrapper on a second wrap (the ``_logfire_wrapped``
+      sentinel keeps options-object reuse safe across multiple
+      ``ClaudeSDKClient`` instances)
+    - return whatever the user callback returned, untouched
+    - work without an active ``_ConversationState`` (no crash, just no log)
+    """
+    user_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def user_callback(tool_name: str, tool_input: dict[str, Any], _ctx: Any) -> Any:
+        user_calls.append((tool_name, tool_input))
+        return PermissionResultAllow()
+
+    wrapped_once = _wrap_can_use_tool(user_callback)
+    wrapped_twice = _wrap_can_use_tool(wrapped_once)
+    assert wrapped_once is wrapped_twice
+
+    _clear_state()  # ensure no state — exercises the no-state branch
+    ctx = SimpleNamespace(tool_use_id='t1', signal=None, suggestions=[], agent_id=None)
+    result = await wrapped_once('Bash', {'command': 'ls'}, ctx)
+    assert isinstance(result, PermissionResultAllow)
+    assert user_calls == [('Bash', {'command': 'ls'})]
+
+
+@pytest.mark.anyio
+async def test_wrap_can_use_tool_emits_log_under_active_root(exporter: TestExporter) -> None:
+    """When a ``_ConversationState`` is active, the wrapper attaches the
+    root span as the OTel context before emitting (mirroring the issue-#9
+    ``_run_hook`` invariant). The resulting log nests under
+    ``invoke_agent``, not as an orphan top-level span.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+
+    async def user_callback(_tool: str, _input: dict[str, Any], _ctx: Any) -> Any:
+        return PermissionResultAllow()
+
+    wrapped = _wrap_can_use_tool(user_callback)
+
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            ctx = SimpleNamespace(tool_use_id='t1', signal=None, suggestions=[], agent_id=None)
+            await wrapped('Read', {'path': '/x'}, ctx)
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_span = next(s for s in spans if s['name'] == 'invoke_agent')
+    log = next(
+        s for s in spans
+        if s['name'] == 'Hook: PermissionResult ({behavior})'
+        and s['attributes'].get('claude.permission_result.behavior') == 'allow'
+    )
+    assert log['parent']['span_id'] == root_span['context']['span_id']
+
+
+def test_inject_hooks_wraps_can_use_tool_when_set() -> None:
+    """``options.can_use_tool`` is opt-in — when set, the integration wraps
+    it transparently. Locks the wrap-on-set behavior so a regression that
+    skips the wrap silently breaks issue-#10 capture for everyone using
+    ``can_use_tool``."""
+
+    async def user_callback(_tool: str, _input: dict[str, Any], _ctx: Any) -> Any:
+        return PermissionResultAllow()
+
+    options = ClaudeAgentOptions(can_use_tool=user_callback)
+    _inject_tracing_hooks(options)
+    assert options.can_use_tool is not user_callback
+    assert getattr(options.can_use_tool, '_logfire_wrapped', False) is True
+
+
+def test_inject_hooks_skips_can_use_tool_when_none() -> None:
+    """No callback → no wrap. Don't materialise a wrapper that would force
+    the SDK to treat the option as set (it's a feature toggle for the
+    streaming-mode permission flow)."""
+    options = ClaudeAgentOptions()
+    assert options.can_use_tool is None
+    _inject_tracing_hooks(options)
+    assert options.can_use_tool is None
 
 
 @pytest.mark.anyio
