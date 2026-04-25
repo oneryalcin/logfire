@@ -531,8 +531,6 @@ async def test_handle_assistant_message_last_write_wins_across_sub_messages(expo
 def test_options_attrs_full() -> None:
     """``_options_attrs`` surfaces every observability-relevant field on the
     invoke_agent root span when the caller populated it."""
-    from claude_agent_sdk import ClaudeAgentOptions
-
     opts = ClaudeAgentOptions(
         model='claude-sonnet-4-6',
         fallback_model='claude-haiku-4-5',
@@ -576,8 +574,6 @@ def test_options_attrs_full() -> None:
 def test_options_attrs_defaults_emit_nothing() -> None:
     """A default-constructed ``ClaudeAgentOptions()`` yields no extra
     attributes — keeps happy-path spans free of always-empty noise."""
-    from claude_agent_sdk import ClaudeAgentOptions
-
     assert _options_attrs(ClaudeAgentOptions()) == {}
 
 
@@ -588,8 +584,6 @@ def test_options_attrs_renames_session_substrings() -> None:
     default scrubber on attribute names. Locked as a test so a refactor
     that "fixes" the names back to the SDK field names regresses scrubbing.
     """
-    from claude_agent_sdk import ClaudeAgentOptions
-
     opts = ClaudeAgentOptions(resume='r', fork_session=True)
     attrs = _options_attrs(opts)
     assert 'claude.resume_from' in attrs
@@ -601,8 +595,6 @@ def test_options_attrs_skills_all_normalises_to_mode_only() -> None:
     """``skills='all'`` emits ``claude.skills_mode='all'`` and NO
     ``claude.skills`` list — keeps the attribute schema stable as a list
     type for downstream typed stores."""
-    from claude_agent_sdk import ClaudeAgentOptions
-
     attrs = _options_attrs(ClaudeAgentOptions(skills='all'))
     assert attrs == {'claude.skills_mode': 'all'}
 
@@ -624,8 +616,6 @@ def test_options_attrs_skips_non_dict_agents() -> None:
     """``agents`` is typed ``dict[str, AgentDefinition] | None``. If a
     future SDK change makes it a list, our extractor must skip rather
     than emit ``[<AgentDefinition repr…>, …]``."""
-    from claude_agent_sdk import ClaudeAgentOptions
-
     opts = ClaudeAgentOptions()
     object.__setattr__(opts, 'agents', ['reviewer', 'planner'])  # simulate shape drift
     attrs = _options_attrs(opts)

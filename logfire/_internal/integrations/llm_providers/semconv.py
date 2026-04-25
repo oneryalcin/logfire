@@ -145,6 +145,10 @@ CLAUDE_PARENT_TOOL_USE_ID = 'claude.parent_tool_use_id'
 # root span when the caller configured them. Names avoid the ``session``
 # substring (which would trip the default scrubber): ``resume`` →
 # ``resume_from``, ``fork_session`` → ``fork_on_resume``.
+# ``model`` and ``fallback_model`` carry the deeper ``.options.`` prefix to
+# disambiguate from per-turn ``gen_ai.request.model`` on chat spans. Other
+# options-derived attrs below are bare ``claude.<field>`` because they have
+# no collision in the existing namespace.
 CLAUDE_OPTIONS_MODEL = 'claude.options.model'
 CLAUDE_OPTIONS_FALLBACK_MODEL = 'claude.options.fallback_model'
 CLAUDE_PERMISSION_MODE = 'claude.permission_mode'
