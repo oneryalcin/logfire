@@ -184,6 +184,20 @@ class BaseScrubber(ABC):
         # ``claude.notification.*`` are deliberately *not* on this list.
         gen_ai_semconv.CLAUDE_COMPACT_INSTRUCTIONS,
         gen_ai_semconv.CLAUDE_STOP_LAST_ASSISTANT_MESSAGE,
+        # Issue #3:
+        # - ``AgentDefinition.prompt`` — operator-set guidance text. Same
+        #   rationale as ``claude.compact.custom_instructions`` above:
+        #   operator-controlled, not user-runtime input.
+        # - ``claude.subagent.last_assistant_message`` mirrors
+        #   ``claude.stop.last_assistant_message`` directly (same source,
+        #   same shape: the verbatim final assistant text — just from the
+        #   subagent's perspective rather than the parent's).
+        # - ``claude.task.summary`` mirrors ``claude.result.text``: a
+        #   model-generated summary of the subagent run.
+        gen_ai_semconv.CLAUDE_AGENT_SYSTEM_PROMPT,
+        gen_ai_semconv.CLAUDE_AGENT_INITIAL_PROMPT,
+        gen_ai_semconv.CLAUDE_SUBAGENT_LAST_ASSISTANT_MESSAGE,
+        gen_ai_semconv.CLAUDE_TASK_SUMMARY,
     }
 
     @abstractmethod
