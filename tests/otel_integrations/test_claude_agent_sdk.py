@@ -27,6 +27,7 @@ import pytest
 pytest.importorskip('claude_agent_sdk', reason='claude_agent_sdk requires Python 3.10+')
 
 from claude_agent_sdk import (
+    AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -62,8 +63,15 @@ from logfire._internal.integrations.claude_agent_sdk import (
     _record_rate_limit_event,
     _record_result,
     _record_stop,
+    _record_subagent_start,
+    _record_subagent_stop,
+    _record_task_notification,
+    _record_task_progress,
+    _record_task_started,
     _record_user_prompt_submit,
     _set_state,
+    _subagent_definition_attrs,
+    _tool_parent_otel_span,
     _wrap_can_use_tool,
     notification_hook,
     permission_request_hook,
@@ -1021,6 +1029,10 @@ def test_inject_hooks_none_hooks() -> None:
         'PreCompact',
         'Notification',
         'PermissionRequest',
+        # Issue #3 — closes the last gap, brings SDK-supported hook
+        # coverage to 10/10.
+        'SubagentStart',
+        'SubagentStop',
     }
     assert set(options.hooks) == expected_events
     for event in expected_events:
@@ -1046,7 +1058,10 @@ def test_inject_hooks_with_existing_events() -> None:
     assert options.hooks['PreToolUse'][1] is existing_hook
     # New non-tool-lifecycle events are added too, even though Opts didn't
     # declare them.
-    for event in ('UserPromptSubmit', 'Stop', 'PreCompact', 'Notification', 'PermissionRequest'):
+    for event in (
+        'UserPromptSubmit', 'Stop', 'PreCompact', 'Notification',
+        'PermissionRequest', 'SubagentStart', 'SubagentStop',
+    ):
         assert event in options.hooks
         assert len(options.hooks[event]) == 1
 
@@ -1999,6 +2014,577 @@ def test_all_lifecycle_and_control_methods_are_wrapped() -> None:
     ):
         fn = getattr(cls, name)
         assert getattr(fn, '__wrapped__', None) is not None, f'{name} should be wrapped'
+
+
+# ---------------------------------------------------------------------------
+# Subagent / Task* tests (issue #3).
+#
+# Three layers locked in this block:
+# 1. ``SubagentStart`` opens a ``subagent <agent_type>`` span keyed by
+#    ``agent_id`` (with optional ``AgentDefinition`` metadata when
+#    ``options.agents[agent_type]`` is configured); ``SubagentStop``
+#    closes it and captures ``last_assistant_message`` + transcript path.
+# 2. ``execute_tool`` spans re-parent under the subagent span when the
+#    PreToolUse hook input carries ``agent_id``.
+# 3. ``TaskStartedMessage`` / ``TaskProgressMessage`` /
+#    ``TaskNotificationMessage`` dispatch as level-appropriate logs.
+#
+# Plus the parallel-subagent disambiguation case — three concurrent
+# subagents with interleaved tool calls all parent correctly via
+# ``state.subagent_spans`` keyed by ``agent_id``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_record_subagent_start_opens_span_keyed_by_agent_id(exporter: TestExporter) -> None:
+    """``SubagentStart`` → opens ``subagent <agent_type>`` span, registers it
+    in ``state.subagent_spans[agent_id]``, increments ``subagent_count``.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_subagent_start(
+            state,
+            {
+                'session_id': 'sess-xyz',
+                'agent_id': 'agent_A_id',
+                'agent_type': 'echo-helper',
+            },
+        )
+        assert state.subagent_count == 1
+        assert 'agent_A_id' in state.subagent_spans
+        # Close so the span end_time is set before snapshot inspection.
+        _record_subagent_stop(state, {'agent_id': 'agent_A_id', 'agent_type': 'echo-helper'})
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    sub = next(s for s in spans if s['name'] == 'subagent {agent_type}')
+    assert sub['attributes']['claude.agent_id'] == 'agent_A_id'
+    assert sub['attributes']['claude.agent_type'] == 'echo-helper'
+    assert sub['attributes']['gen_ai.agent.name'] == 'echo-helper'
+    assert sub['attributes']['gen_ai.conversation.id'] == 'sess-xyz'
+
+
+@pytest.mark.anyio
+async def test_record_subagent_stop_captures_last_assistant_message_and_transcript(exporter: TestExporter) -> None:
+    """``SubagentStop`` closes the span and captures the verbatim
+    ``last_assistant_message`` (undocumented wire field, mirrors the
+    regular ``Stop`` hook from #9) plus ``agent_transcript_path``."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_subagent_start(state, {'agent_id': 'agent_X', 'agent_type': 'reviewer'})
+        _record_subagent_stop(
+            state,
+            {
+                'agent_id': 'agent_X',
+                'agent_type': 'reviewer',
+                'last_assistant_message': 'review complete: looks good',
+                'agent_transcript_path': '/tmp/.claude/subagents/agent-X.jsonl',
+            },
+        )
+        # Span popped from active dict.
+        assert 'agent_X' not in state.subagent_spans
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    sub = next(s for s in spans if s['name'] == 'subagent {agent_type}')
+    assert sub['attributes']['claude.subagent.last_assistant_message'] == 'review complete: looks good'
+    assert sub['attributes']['claude.agent.transcript_path'] == '/tmp/.claude/subagents/agent-X.jsonl'
+
+
+@pytest.mark.anyio
+async def test_record_subagent_stop_no_open_span_emits_no_crash(exporter: TestExporter) -> None:
+    """Defensive: ``SubagentStop`` arriving without a matching ``Start``
+    (e.g. SDK bug, message-stream out-of-order) is a no-op rather than a
+    crash."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        # No matching Start. Must not raise.
+        _record_subagent_stop(state, {'agent_id': 'orphan_agent', 'agent_type': 'whatever'})
+    # Nothing additional in the export beyond the root invoke_agent.
+
+
+@pytest.mark.anyio
+async def test_subagent_definition_attrs_full_capture() -> None:
+    """``_subagent_definition_attrs`` extracts ``AgentDefinition`` metadata
+    from ``options.agents[agent_type]`` for the subagent span (issue #3,
+    Option B). Mirrors the ``_options_attrs`` pattern from #8 — defensive
+    ``isinstance`` guard, optional-field skip, list-when-non-empty."""
+    options = ClaudeAgentOptions(
+        agents={
+            'reviewer': AgentDefinition(
+                description='Reviews code changes for safety.',
+                prompt='You are a careful reviewer.',
+                tools=['Read', 'Grep'],
+                disallowedTools=['Bash'],
+                model='haiku',
+                skills=['code-review'],
+                memory='project',
+            ),
+        },
+    )
+    attrs = _subagent_definition_attrs(options, 'reviewer')
+    assert attrs == {
+        'claude.agent.description': 'Reviews code changes for safety.',
+        'claude.agent.system_prompt': 'You are a careful reviewer.',
+        'claude.agent.model': 'haiku',
+        'claude.agent.memory': 'project',
+        'claude.agent.tools': ['Read', 'Grep'],
+        'claude.agent.disallowed_tools': ['Bash'],
+        'claude.agent.skills': ['code-review'],
+    }
+
+
+def test_subagent_definition_attrs_returns_empty_for_missing_or_invalid() -> None:
+    """The lookup is best-effort: returns ``{}`` when options is None,
+    when ``agents`` isn't a dict, when the agent_type isn't in the map,
+    or when the value isn't a recognisable ``AgentDefinition`` (duck-typed
+    mocks). Never crashes."""
+    # No options.
+    assert _subagent_definition_attrs(None, 'reviewer') == {}
+
+    # options.agents is None.
+    options_no_agents = ClaudeAgentOptions()
+    assert _subagent_definition_attrs(options_no_agents, 'reviewer') == {}
+
+    # options.agents is a dict but agent_type not in it.
+    options_with_agents = ClaudeAgentOptions(
+        agents={'other': AgentDefinition(description='x', prompt='y')},
+    )
+    assert _subagent_definition_attrs(options_with_agents, 'reviewer') == {}
+
+    # Defensive: SimpleNamespace mock with the right shape — gets rejected
+    # by the isinstance guard so we don't ship garbage attribute values.
+    class FakeOpts:
+        agents = {'reviewer': SimpleNamespace(model='haiku', description='fake')}
+
+    assert _subagent_definition_attrs(FakeOpts(), 'reviewer') == {}
+
+
+@pytest.mark.anyio
+async def test_record_subagent_start_pulls_agent_definition_when_set(exporter: TestExporter) -> None:
+    """End-to-end: ``_record_subagent_start`` looks up
+    ``options.agents[agent_type]`` via ``state.options`` and surfaces the
+    ``AgentDefinition`` metadata on the subagent span. Without options,
+    only the basic identity attrs land."""
+    options = ClaudeAgentOptions(
+        agents={
+            'echo-helper': AgentDefinition(
+                description='Trivial echo helper',
+                prompt='Echo what you receive',
+                tools=['Bash'],
+                model='haiku',
+            ),
+        },
+    )
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(
+            logfire=logfire_instance,
+            root_span=root,
+            input_messages=[],
+            options=options,
+        )
+        _record_subagent_start(state, {'agent_id': 'a1', 'agent_type': 'echo-helper'})
+        _record_subagent_stop(state, {'agent_id': 'a1', 'agent_type': 'echo-helper'})
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    sub = next(s for s in spans if s['name'] == 'subagent {agent_type}')
+    assert sub['attributes']['claude.agent.model'] == 'haiku'
+    assert sub['attributes']['claude.agent.description'] == 'Trivial echo helper'
+    assert sub['attributes']['claude.agent.system_prompt'] == 'Echo what you receive'
+    assert sub['attributes']['claude.agent.tools'] == ['Bash']
+
+
+@pytest.mark.anyio
+async def test_tool_parent_otel_span_picks_subagent_when_agent_id_present(exporter: TestExporter) -> None:
+    """Locks the issue-#3 re-parent contract: when ``input_data`` carries
+    ``agent_id`` AND ``state.subagent_spans`` has a span for it,
+    ``_tool_parent_otel_span`` returns the subagent's OTel span (so the
+    next ``execute_tool`` parents under it). Otherwise → root.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_subagent_start(state, {'agent_id': 'agent_A', 'agent_type': 'helper'})
+
+        # Subagent context — should return subagent's OTel span.
+        sub_otel = _tool_parent_otel_span(state, {'agent_id': 'agent_A', 'tool_name': 'Bash'})
+        assert sub_otel is not None
+        assert sub_otel is state.subagent_spans['agent_A']._span  # type: ignore[attr-defined]
+
+        # No agent_id — main thread; should return root.
+        root_otel = _tool_parent_otel_span(state, {'tool_name': 'Bash'})
+        assert root_otel is state.root_span._span  # type: ignore[attr-defined]
+
+        # agent_id present but no matching subagent span (defensive) → root.
+        unknown = _tool_parent_otel_span(state, {'agent_id': 'unknown_agent', 'tool_name': 'Bash'})
+        assert unknown is state.root_span._span  # type: ignore[attr-defined]
+
+        _record_subagent_stop(state, {'agent_id': 'agent_A', 'agent_type': 'helper'})
+
+
+@pytest.mark.anyio
+async def test_pre_tool_use_hook_reparents_under_subagent_when_agent_id_set(exporter: TestExporter) -> None:
+    """End-to-end via the public hook callbacks: when ``pre_tool_use_hook``
+    fires with ``agent_id`` in the input dict (the SDK marks tool calls
+    originating inside a subagent context this way), the resulting
+    ``execute_tool`` span has the subagent span as its parent — not the
+    root ``invoke_agent``. Locks the most subtle invariant of #3."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    ctx: HookContext = {'signal': None}
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            # Open subagent span first (mimics SubagentStart firing).
+            _record_subagent_start(state, {'agent_id': 'agent_A', 'agent_type': 'helper'})
+
+            # Now a tool call from inside the subagent.
+            await pre_tool_use_hook(
+                {
+                    'tool_name': 'Bash',
+                    'tool_input': {'command': 'ls'},
+                    'tool_use_id': 'tu_sub_1',
+                    'agent_id': 'agent_A',
+                    'agent_type': 'helper',
+                },
+                'tu_sub_1',
+                ctx,
+            )
+            await post_tool_use_hook(
+                {
+                    'tool_name': 'Bash',
+                    'tool_input': {'command': 'ls'},
+                    'tool_response': 'file1\n',
+                    'tool_use_id': 'tu_sub_1',
+                    'agent_id': 'agent_A',
+                    'agent_type': 'helper',
+                },
+                'tu_sub_1',
+                ctx,
+            )
+
+            _record_subagent_stop(state, {'agent_id': 'agent_A', 'agent_type': 'helper'})
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    tool_span = next(s for s in spans if s['name'] == 'execute_tool Bash')
+    sub_span = next(s for s in spans if s['name'] == 'subagent {agent_type}')
+    # Tool span's parent IS the subagent span (not the root invoke_agent).
+    assert tool_span['parent']['span_id'] == sub_span['context']['span_id']
+
+
+@pytest.mark.anyio
+async def test_pre_tool_use_hook_parents_under_root_when_no_agent_id(exporter: TestExporter) -> None:
+    """Symmetric check: a normal (non-subagent) tool call still parents
+    under the root ``invoke_agent``. Catches a regression where
+    ``_tool_parent_otel_span`` accidentally always selects a subagent
+    span (e.g. due to stale state)."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    ctx: HookContext = {'signal': None}
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            # Open and close a subagent span — it should NOT influence
+            # subsequent root-thread tool calls.
+            _record_subagent_start(state, {'agent_id': 'agent_A', 'agent_type': 'helper'})
+            _record_subagent_stop(state, {'agent_id': 'agent_A', 'agent_type': 'helper'})
+
+            # Tool call from the main thread (no agent_id).
+            await pre_tool_use_hook(
+                {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}, 'tool_use_id': 'tu_root_1'},
+                'tu_root_1',
+                ctx,
+            )
+            await post_tool_use_hook(
+                {
+                    'tool_name': 'Bash',
+                    'tool_input': {'command': 'ls'},
+                    'tool_response': 'ok',
+                    'tool_use_id': 'tu_root_1',
+                },
+                'tu_root_1',
+                ctx,
+            )
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    tool_span = next(s for s in spans if s['name'] == 'execute_tool Bash')
+    root_span = next(s for s in spans if s['name'] == 'invoke_agent')
+    assert tool_span['parent']['span_id'] == root_span['context']['span_id']
+
+
+@pytest.mark.anyio
+async def test_three_parallel_subagents_each_tool_lands_under_correct_span(exporter: TestExporter) -> None:
+    """**The parallel-subagent correctness lock.** Three concurrent
+    subagents (A, B, C) with interleaved tool calls. Each subagent's
+    tool-lifecycle hook fires with its own ``agent_id`` — the
+    ``_tool_parent_otel_span`` lookup keys by agent_id and parents the
+    ``execute_tool`` span under the right subagent.
+
+    SubagentStart / SubagentStop ordering simulates real interleaving
+    (B starts last but finishes first, etc.) to catch any state-machine
+    assumption that subagents complete in-order.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    ctx: HookContext = {'signal': None}
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            # Three SubagentStart events (parent dispatched 3 Tasks).
+            _record_subagent_start(state, {'agent_id': 'A_id', 'agent_type': 'reviewer'})
+            _record_subagent_start(state, {'agent_id': 'B_id', 'agent_type': 'planner'})
+            _record_subagent_start(state, {'agent_id': 'C_id', 'agent_type': 'reviewer'})  # same type as A
+
+            # All three subagent spans are open simultaneously.
+            assert set(state.subagent_spans) == {'A_id', 'B_id', 'C_id'}
+
+            # Interleaved tool calls — each carries its own agent_id.
+            await pre_tool_use_hook(
+                {'tool_name': 'Read', 'tool_input': {}, 'tool_use_id': 'tu_A1', 'agent_id': 'A_id'},
+                'tu_A1', ctx,
+            )
+            await pre_tool_use_hook(
+                {'tool_name': 'Bash', 'tool_input': {}, 'tool_use_id': 'tu_C1', 'agent_id': 'C_id'},
+                'tu_C1', ctx,
+            )
+            await pre_tool_use_hook(
+                {'tool_name': 'Grep', 'tool_input': {}, 'tool_use_id': 'tu_B1', 'agent_id': 'B_id'},
+                'tu_B1', ctx,
+            )
+            # Posts in different order from pre.
+            await post_tool_use_hook(
+                {'tool_name': 'Bash', 'tool_input': {}, 'tool_response': 'x', 'tool_use_id': 'tu_C1', 'agent_id': 'C_id'},
+                'tu_C1', ctx,
+            )
+            await post_tool_use_hook(
+                {'tool_name': 'Read', 'tool_input': {}, 'tool_response': 'x', 'tool_use_id': 'tu_A1', 'agent_id': 'A_id'},
+                'tu_A1', ctx,
+            )
+            await post_tool_use_hook(
+                {'tool_name': 'Grep', 'tool_input': {}, 'tool_response': 'x', 'tool_use_id': 'tu_B1', 'agent_id': 'B_id'},
+                'tu_B1', ctx,
+            )
+
+            # Stops in different order from starts (B finishes first, then A, then C).
+            _record_subagent_stop(state, {'agent_id': 'B_id', 'agent_type': 'planner'})
+            _record_subagent_stop(state, {'agent_id': 'A_id', 'agent_type': 'reviewer'})
+            _record_subagent_stop(state, {'agent_id': 'C_id', 'agent_type': 'reviewer'})
+
+            # All cleanly closed.
+            assert state.subagent_spans == {}
+            assert state.subagent_count == 3
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    # Two subagent spans of type 'reviewer' (A and C) and one 'planner' (B).
+    sub_spans = [s for s in spans if s['name'] == 'subagent {agent_type}']
+    assert len(sub_spans) == 3
+    by_agent_id = {s['attributes']['claude.agent_id']: s for s in sub_spans}
+    assert set(by_agent_id) == {'A_id', 'B_id', 'C_id'}
+
+    # The disambiguator: each tool span's parent is its subagent's span,
+    # NOT a sibling subagent's, NOT the root.
+    tool_spans = [s for s in spans if s['name'].startswith('execute_tool ')]
+    parent_by_tool_id = {s['attributes']['gen_ai.tool.call.id']: s['parent']['span_id'] for s in tool_spans}
+    assert parent_by_tool_id['tu_A1'] == by_agent_id['A_id']['context']['span_id']
+    assert parent_by_tool_id['tu_B1'] == by_agent_id['B_id']['context']['span_id']
+    assert parent_by_tool_id['tu_C1'] == by_agent_id['C_id']['context']['span_id']
+
+
+@pytest.mark.anyio
+async def test_state_close_ends_orphan_subagent_spans(exporter: TestExporter) -> None:
+    """If a subagent's ``Start`` fires but ``Stop`` never does (session
+    abort, error mid-conversation), ``state.close()`` must end the
+    orphan span so it doesn't leak open until process exit. Also clears
+    ``subagent_spans``."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_subagent_start(state, {'agent_id': 'orphan_A', 'agent_type': 'helper'})
+        _record_subagent_start(state, {'agent_id': 'orphan_B', 'agent_type': 'helper'})
+        # Neither receives a Stop — simulate aborted session.
+        state.close()
+        assert state.subagent_spans == {}
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    orphans = [s for s in spans if s['name'] == 'subagent {agent_type}']
+    assert len(orphans) == 2
+    # Both have end_time set (closed by state.close, not still open).
+    # ``exporter.exported_spans_as_dict`` only includes finished spans, so
+    # presence here is the proof.
+
+
+@pytest.mark.anyio
+async def test_state_close_emits_subagent_count_when_nonzero(exporter: TestExporter) -> None:
+    """``claude.subagent_count`` lands on the root span at close, mirroring
+    the other counter aggregates from #9. Skipped when zero (happy-path
+    sessions don't carry an always-zero attribute)."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_subagent_start(state, {'agent_id': 'A', 'agent_type': 'helper'})
+        _record_subagent_stop(state, {'agent_id': 'A', 'agent_type': 'helper'})
+        _record_subagent_start(state, {'agent_id': 'B', 'agent_type': 'helper'})
+        _record_subagent_stop(state, {'agent_id': 'B', 'agent_type': 'helper'})
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    assert root_attrs['claude.subagent_count'] == 2
+
+
+@pytest.mark.anyio
+async def test_state_close_skips_zero_subagent_count(exporter: TestExporter) -> None:
+    """No subagents fired → no ``claude.subagent_count`` on root."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        state.close()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    root_attrs = next(s for s in spans if s['name'] == 'invoke_agent')['attributes']
+    assert 'claude.subagent_count' not in root_attrs
+
+
+@pytest.mark.anyio
+async def test_record_task_started_emits_info_log_with_correlation_attrs(exporter: TestExporter) -> None:
+    """``TaskStartedMessage`` → info log with ``claude.task_id``,
+    ``claude.task.description``, ``claude.task.type``, and the parent's
+    ``gen_ai.tool.call.id`` (the Task tool's id) for cross-span correlation."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        msg = SimpleNamespace(
+            task_id='task_001',
+            description='Echo a phrase via Bash',
+            uuid='uuid-task-1',
+            session_id='sess-x',
+            tool_use_id='toolu_parent_call',
+            task_type='local_agent',
+        )
+        _record_task_started(state, msg)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Task started')
+    assert log['attributes']['claude.task_id'] == 'task_001'
+    assert log['attributes']['claude.task.description'] == 'Echo a phrase via Bash'
+    assert log['attributes']['claude.task.type'] == 'local_agent'
+    assert log['attributes']['gen_ai.tool.call.id'] == 'toolu_parent_call'
+    assert log['attributes']['gen_ai.conversation.id'] == 'sess-x'
+    assert log['attributes']['logfire.level_num'] == 9  # info
+
+
+@pytest.mark.anyio
+async def test_record_task_progress_emits_info_log_with_usage(exporter: TestExporter) -> None:
+    """``TaskProgressMessage`` → info log with ``claude.task.usage`` (the
+    full TaskUsage dict — total_tokens, tool_uses, duration_ms) and
+    ``claude.task.last_tool_name``."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        msg = SimpleNamespace(
+            task_id='task_002',
+            description='Long-running analysis',
+            usage={'total_tokens': 5000, 'tool_uses': 3, 'duration_ms': 12000},
+            uuid='uuid-task-2',
+            session_id='sess-y',
+            tool_use_id='toolu_parent_call_2',
+            last_tool_name='Bash',
+        )
+        _record_task_progress(state, msg)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Task progress')
+    assert log['attributes']['claude.task_id'] == 'task_002'
+    assert log['attributes']['claude.task.last_tool_name'] == 'Bash'
+    assert log['attributes']['claude.task.usage'] == {
+        'total_tokens': 5000,
+        'tool_uses': 3,
+        'duration_ms': 12000,
+    }
+    assert log['attributes']['logfire.level_num'] == 9  # info
+
+
+@pytest.mark.anyio
+async def test_record_task_notification_status_completed_is_info(exporter: TestExporter) -> None:
+    """``status='completed'`` → info level."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        msg = SimpleNamespace(
+            task_id='task_ok',
+            status='completed',
+            output_file='/tmp/task_ok.txt',
+            summary='Done',
+            uuid='u',
+            session_id='s',
+            tool_use_id='t',
+            usage=None,
+        )
+        _record_task_notification(state, msg)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Task {status}')
+    assert log['attributes']['claude.task.status'] == 'completed'
+    assert log['attributes']['claude.task.summary'] == 'Done'
+    assert log['attributes']['claude.task.output_file'] == '/tmp/task_ok.txt'
+    assert log['attributes']['logfire.level_num'] == 9  # info
+
+
+@pytest.mark.anyio
+async def test_record_task_notification_status_failed_is_error(exporter: TestExporter) -> None:
+    """``status='failed'`` → error level. Audit-relevant: subagent crashes
+    surface in error dashboards even when the parent recovers gracefully."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        msg = SimpleNamespace(
+            task_id='task_fail',
+            status='failed',
+            output_file='',
+            summary='subagent hit an internal error',
+            uuid='u',
+            session_id='s',
+            tool_use_id='t',
+            usage=None,
+        )
+        _record_task_notification(state, msg)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Task {status}')
+    assert log['attributes']['logfire.level_num'] == 17  # error
+
+
+@pytest.mark.anyio
+async def test_record_task_notification_status_stopped_is_warn(exporter: TestExporter) -> None:
+    """``status='stopped'`` → warn level. User-initiated cancellations
+    (via ``stop_task`` from #11) shouldn't be filed as errors but ARE
+    audit-relevant."""
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        msg = SimpleNamespace(
+            task_id='task_stop',
+            status='stopped',
+            output_file='',
+            summary='stopped by user',
+            uuid='u',
+            session_id='s',
+            tool_use_id='t',
+            usage=None,
+        )
+        _record_task_notification(state, msg)
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    log = next(s for s in spans if s['name'] == 'Task {status}')
+    assert log['attributes']['logfire.level_num'] == 13  # warn
 
 
 @pytest.mark.anyio

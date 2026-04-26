@@ -258,6 +258,73 @@ CLAUDE_MCP_SERVER_NAME = 'claude.mcp.server_name'
 CLAUDE_MCP_ENABLED = 'claude.mcp.enabled'
 CLAUDE_TASK_ID = 'claude.task_id'
 
+# Subagent / Task* attributes (issue #3). Surfaced on the
+# ``subagent <agent_type>`` span opened on ``SubagentStart`` and on logs
+# dispatched from ``TaskStartedMessage`` / ``TaskProgressMessage`` /
+# ``TaskNotificationMessage`` system-message events.
+#
+# SAFE_KEYS treatment (in scrubbing.py):
+#   * ``claude.subagent.last_assistant_message`` — model-generated final
+#     subagent text. Allowlisted: same shape as
+#     ``claude.stop.last_assistant_message`` (the parent-thread analogue),
+#     which is also allowlisted. Operators expect the verbatim text to
+#     survive default scrubbing, since pattern-based redaction would
+#     destroy model output content.
+#   * ``claude.task.summary`` — model-generated end-of-task summary.
+#     Allowlisted: same shape as ``claude.result.text`` (also allowlisted).
+#
+# NOT on SAFE_KEYS:
+#   * ``claude.task.description`` — caller-supplied prompt text from the
+#     parent's Task tool call (``ToolUseBlock.input.description``); default
+#     scrubbing is the safer privacy posture, mirroring ``claude.user_prompt``.
+#   * ``claude.agent.transcript_path`` — filesystem path that may match
+#     ``auth``/``secret``/``private_key`` patterns; default scrub correct.
+#   * Other fields are short identifiers / enums / int dicts where scrubbing
+#     is a no-op or near-no-op.
+CLAUDE_TASK_DESCRIPTION = 'claude.task.description'
+CLAUDE_TASK_TYPE = 'claude.task.type'
+CLAUDE_TASK_STATUS = 'claude.task.status'
+CLAUDE_TASK_SUMMARY = 'claude.task.summary'
+CLAUDE_TASK_OUTPUT_FILE = 'claude.task.output_file'
+CLAUDE_TASK_USAGE = 'claude.task.usage'
+CLAUDE_TASK_LAST_TOOL_NAME = 'claude.task.last_tool_name'
+CLAUDE_AGENT_TRANSCRIPT_PATH = 'claude.agent.transcript_path'
+# ``last_assistant_message`` is on the wire on ``SubagentStop`` events
+# but NOT in the SDK's ``SubagentStopHookInput`` type — captured
+# defensively via ``.get()`` (mirrors ``claude.stop.last_assistant_message``
+# from #9).
+CLAUDE_SUBAGENT_LAST_ASSISTANT_MESSAGE = 'claude.subagent.last_assistant_message'
+# Cumulative subagent count emitted on the root invoke_agent at close.
+CLAUDE_SUBAGENT_COUNT = 'claude.subagent_count'
+
+# ``AgentDefinition`` metadata captured on the subagent span at
+# ``SubagentStart`` time (issue #3, Option B). Mirrors the
+# ``_options_attrs`` pattern from #8 — looked up via
+# ``options.agents[agent_type]``. Without this, the subagent span shows
+# only ``agent_id`` / ``agent_type`` / transcript path; with it, dashboards
+# can group / filter by which subagent model / tool allowlist is in use,
+# and the system prompt is queryable for audit.
+CLAUDE_AGENT_MODEL = 'claude.agent.model'
+CLAUDE_AGENT_DESCRIPTION = 'claude.agent.description'
+CLAUDE_AGENT_TOOLS = 'claude.agent.tools'
+CLAUDE_AGENT_DISALLOWED_TOOLS = 'claude.agent.disallowed_tools'
+CLAUDE_AGENT_SKILLS = 'claude.agent.skills'
+CLAUDE_AGENT_MEMORY = 'claude.agent.memory'
+CLAUDE_AGENT_BACKGROUND = 'claude.agent.background'
+# ``claude.agent.system_prompt`` and ``claude.agent.initial_prompt`` carry
+# operator-set guidance text. Both added to SAFE_KEYS — same rationale as
+# ``claude.compact.custom_instructions`` from #9: operator-controlled, not
+# user-runtime input.
+CLAUDE_AGENT_SYSTEM_PROMPT = 'claude.agent.system_prompt'
+CLAUDE_AGENT_INITIAL_PROMPT = 'claude.agent.initial_prompt'
+# Note: ``AgentDefinition.permissionMode`` / ``maxTurns`` / ``effort`` are
+# captured under the existing ``CLAUDE_PERMISSION_MODE`` / ``CLAUDE_MAX_TURNS``
+# / ``CLAUDE_EFFORT`` constants from #8 — same configuration concepts;
+# span name (``invoke_agent`` vs ``subagent <agent_type>``) disambiguates
+# whether they're parent-options or subagent-definition values in dashboards.
+# ``mcpServers`` is deliberately not captured here: potentially large,
+# contains nested config dicts; deferred to a separate extractor.
+
 # Type definitions for message parts and messages
 
 

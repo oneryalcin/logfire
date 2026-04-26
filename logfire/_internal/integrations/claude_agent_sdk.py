@@ -27,12 +27,26 @@ from claude_agent_sdk.types import HookContext, SyncHookJSONOutput
 # a redundant try/except on a module we've already imported above.
 RateLimitEvent = getattr(claude_agent_sdk, 'RateLimitEvent', None)
 MirrorErrorMessage = getattr(claude_agent_sdk, 'MirrorErrorMessage', None)
+# Issue #3 — Task* SystemMessage subclasses for subagent dispatch.
+TaskStartedMessage = getattr(claude_agent_sdk, 'TaskStartedMessage', None)
+TaskProgressMessage = getattr(claude_agent_sdk, 'TaskProgressMessage', None)
+TaskNotificationMessage = getattr(claude_agent_sdk, 'TaskNotificationMessage', None)
 
 from opentelemetry import context as context_api, trace as trace_api
 
 from logfire._internal.integrations.llm_providers.semconv import (
     AGENT_NAME,
+    CLAUDE_AGENT_BACKGROUND,
+    CLAUDE_AGENT_DESCRIPTION,
+    CLAUDE_AGENT_DISALLOWED_TOOLS,
     CLAUDE_AGENT_ID,
+    CLAUDE_AGENT_INITIAL_PROMPT,
+    CLAUDE_AGENT_MEMORY,
+    CLAUDE_AGENT_MODEL,
+    CLAUDE_AGENT_SKILLS,
+    CLAUDE_AGENT_SYSTEM_PROMPT,
+    CLAUDE_AGENT_TOOLS,
+    CLAUDE_AGENT_TRANSCRIPT_PATH,
     CLAUDE_AGENT_TYPE,
     CLAUDE_AGENTS,
     CLAUDE_ALLOWED_TOOLS,
@@ -83,7 +97,16 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_SKILLS_MODE,
     CLAUDE_STOP_HOOK_ACTIVE,
     CLAUDE_STOP_LAST_ASSISTANT_MESSAGE,
+    CLAUDE_SUBAGENT_COUNT,
+    CLAUDE_SUBAGENT_LAST_ASSISTANT_MESSAGE,
+    CLAUDE_TASK_DESCRIPTION,
     CLAUDE_TASK_ID,
+    CLAUDE_TASK_LAST_TOOL_NAME,
+    CLAUDE_TASK_OUTPUT_FILE,
+    CLAUDE_TASK_STATUS,
+    CLAUDE_TASK_SUMMARY,
+    CLAUDE_TASK_TYPE,
+    CLAUDE_TASK_USAGE,
     CLAUDE_TOOL_CALL_ARGUMENTS_ORIGINAL,
     CLAUDE_TOOLS_USED,
     CLAUDE_USER_PROMPT,
@@ -338,6 +361,26 @@ def _options_attrs(options: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _tool_parent_otel_span(state: _ConversationState, input_data: Any) -> Any:
+    """Return the OTel span the ``execute_tool`` should parent under (issue #3).
+
+    When the tool-lifecycle hook fires inside a subagent context (``agent_id``
+    present in ``input_data`` AND the matching subagent span is open),
+    parent under the subagent span so the trace tree groups the subagent's
+    tool calls together. Otherwise parent under the root ``invoke_agent``.
+
+    Returns ``None`` if no usable parent OTel span is available (root span
+    already ended); caller should noop.
+    """
+    if isinstance(input_data, dict):
+        agent_id = input_data.get('agent_id')
+        if agent_id and (subagent_span := state.subagent_spans.get(agent_id)):
+            otel = subagent_span._span  # pyright: ignore[reportPrivateUsage]
+            if otel is not None:
+                return otel
+    return state.root_span._span  # pyright: ignore[reportPrivateUsage]
+
+
 async def pre_tool_use_hook(
     input_data: Any,
     tool_use_id: str | None,
@@ -364,7 +407,9 @@ async def pre_tool_use_hook(
         # Temporarily attach root span context so the new span is parented correctly,
         # then immediately detach. We can't keep the context attached because hooks
         # run in different async contexts (anyio tasks) and detaching later would fail.
-        otel_span = state.root_span._span  # pyright: ignore[reportPrivateUsage]
+        # Issue #3: when the call comes from a subagent (agent_id present),
+        # parent under the subagent span instead of the root invoke_agent.
+        otel_span = _tool_parent_otel_span(state, input_data)
         if otel_span is None:  # pragma: no cover
             return {}
         parent_ctx = trace_api.set_span_in_context(otel_span)
@@ -511,7 +556,7 @@ async def _run_hook(
     record_fn: Any,
     input_data: Any,
 ) -> None:
-    """Shared boilerplate for the 5 issue-#9 hook callbacks.
+    """Shared boilerplate for the 7 hook callbacks (5 from #9 + 2 from #3).
 
     Each callback runs ``record_fn(state, input_data)`` inside the root
     span's OTel context (hooks run in different anyio tasks so contextvars
@@ -600,6 +645,47 @@ async def permission_request_hook(
     on issue #9 for the boundary rationale.
     """
     await _run_hook(_record_permission_request, input_data)
+    return {}
+
+
+async def subagent_start_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: HookContext,
+) -> SyncHookJSONOutput:
+    """Open a ``subagent <agent_type>`` span when a Task-spawned subagent starts (issue #3).
+
+    The span lives until the matching ``SubagentStop`` (keyed by ``agent_id``);
+    PreToolUse / PostToolUse / PostToolUseFailure hooks fired inside the
+    subagent context (with ``agent_id`` set on the hook input) re-parent
+    their ``execute_tool`` spans under it via ``_tool_parent_otel_span``
+    (called from ``pre_tool_use_hook``).
+    """
+    await _run_hook(_record_subagent_start, input_data)
+    return {}
+
+
+async def subagent_stop_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: HookContext,
+) -> SyncHookJSONOutput:
+    """Close the ``subagent`` span on ``SubagentStop`` (issue #3).
+
+    The span envelope itself is the event record — no separate log is
+    emitted. The lifetime of the ``subagent <agent_type>`` span is the
+    audit signal; ``claude.subagent.last_assistant_message`` and
+    ``claude.agent.transcript_path`` are set on the span at close time
+    rather than as a log, mirroring how ``execute_tool`` doesn't emit a
+    separate "tool finished" log.
+
+    Captures ``last_assistant_message`` defensively via ``.get()`` — the
+    field is on the wire but absent from ``SubagentStopHookInput`` (mirrors
+    issue #9's ``Stop`` hook). Carries the verbatim final subagent text,
+    which is high-value audit signal for "what did the subagent ultimately
+    say".
+    """
+    await _run_hook(_record_subagent_stop, input_data)
     return {}
 
 
@@ -714,6 +800,7 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
                 root_span=root_span,
                 input_messages=input_messages,
                 system_instructions=span_data.get(SYSTEM_INSTRUCTIONS),
+                options=getattr(self, 'options', None),
             )
             _set_state(state)
             # Open the first chat span now — the LLM call starts at query time.
@@ -735,6 +822,18 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
                             _record_rate_limit_event(logfire_claude, root_span, msg)
                         elif MirrorErrorMessage is not None and isinstance(msg, MirrorErrorMessage):
                             _record_mirror_error(logfire_claude, msg)
+                        # Issue #3 — Task* SystemMessage subclasses.
+                        # ``TaskProgressMessage`` typically only fires for
+                        # background / long-running subagents; foreground
+                        # subagents finish before any progress event. Patch
+                        # dispatches all 3 generically — fg/bg asymmetry is
+                        # an SDK-side emission detail.
+                        elif TaskStartedMessage is not None and isinstance(msg, TaskStartedMessage):
+                            _record_task_started(state, msg)
+                        elif TaskProgressMessage is not None and isinstance(msg, TaskProgressMessage):
+                            _record_task_progress(state, msg)
+                        elif TaskNotificationMessage is not None and isinstance(msg, TaskNotificationMessage):
+                            _record_task_notification(state, msg)
 
                     yield msg
             finally:
@@ -967,6 +1066,10 @@ def _inject_tracing_hooks(options: Any) -> None:
             ('PreCompact', pre_compact_hook),
             ('Notification', notification_hook),
             ('PermissionRequest', permission_request_hook),
+            # Issue #3 — closes the last gap, brings SDK-supported hook
+            # coverage to 10/10.
+            ('SubagentStart', subagent_start_hook),
+            ('SubagentStop', subagent_stop_hook),
         )
         for event, callback in events_to_callbacks:
             hooks.setdefault(event, [])
@@ -995,9 +1098,15 @@ class _ConversationState:
         root_span: LogfireSpan,
         input_messages: list[ChatMessage],
         system_instructions: list[TextPart] | None = None,
+        options: Any = None,
     ) -> None:
         self.logfire = logfire
         self.root_span = root_span
+        # Issue #3: ``ClaudeAgentOptions`` reference kept so the subagent
+        # helper can look up the matching ``AgentDefinition`` at
+        # ``SubagentStart`` time (the hook input only carries ``agent_type``;
+        # the full definition lives in ``options.agents[agent_type]``).
+        self.options = options
         self.active_tool_spans: dict[str, LogfireSpan] = {}
         # Tool input as seen by ``pre_tool_use_hook`` keyed by ``tool_use_id``.
         # ``post_tool_use_hook`` consumes it to detect updatedInput mutations
@@ -1016,6 +1125,14 @@ class _ConversationState:
         self.compact_count = 0
         self.notification_count = 0
         self.permission_request_count = 0
+        # Subagent state (issue #3). One open span per active subagent,
+        # keyed by ``agent_id`` (SDK-generated, opaque). Tool-lifecycle
+        # hooks fired with ``agent_id`` look up the corresponding span
+        # here to re-parent the ``execute_tool`` span. Cleared on
+        # ``SubagentStop``; orphan spans (missing Stop) get ``state.close()``
+        # treatment.
+        self.subagent_spans: dict[str, LogfireSpan] = {}
+        self.subagent_count = 0
 
     def add_tool_result(self, tool_use_id: str, tool_name: str, result: Any) -> None:
         """Record a tool result to include in the next chat span's input messages."""
@@ -1147,10 +1264,16 @@ class _ConversationState:
             (self.compact_count, CLAUDE_COMPACT_COUNT),
             (self.notification_count, CLAUDE_NOTIFICATION_COUNT),
             (self.permission_request_count, CLAUDE_PERMISSION_REQUEST_COUNT),
+            (self.subagent_count, CLAUDE_SUBAGENT_COUNT),
         )
         for value, attr in counter_map:
             if value:
                 self.root_span.set_attribute(attr, value)
+        # Close any orphan subagent spans (missing ``SubagentStop`` due to
+        # session abort, error, etc.). Issue #3.
+        for span in self.subagent_spans.values():
+            span._end()  # pyright: ignore[reportPrivateUsage]
+        self.subagent_spans.clear()
         for span in self.active_tool_spans.values():
             span._end()  # pyright: ignore[reportPrivateUsage]
         self.active_tool_spans.clear()
@@ -1534,3 +1657,242 @@ def _wrap_can_use_tool(callback: Any) -> Any:
 
     wrapped._logfire_wrapped = True  # type: ignore[attr-defined]
     return wrapped
+
+
+# ---------------------------------------------------------------------------
+# Subagent / Task* helpers (issue #3).
+#
+# Subagent lifecycle is paired ``SubagentStart`` → ``SubagentStop`` keyed by
+# ``agent_id``; the open ``subagent <agent_type>`` span lives in
+# ``state.subagent_spans`` so the tool-lifecycle hooks can re-parent
+# ``execute_tool`` spans onto it via ``_tool_parent_otel_span``.
+#
+# Task* SystemMessage subclasses arrive in the dispatch loop. The Task tool
+# itself surfaces in current SDK versions as ``execute_tool Agent`` (older
+# versions: ``execute_tool Task``); Task* messages carry a ``tool_use_id``
+# that correlates back to that span if needed downstream.
+# ---------------------------------------------------------------------------
+
+
+def _record_subagent_start(state: _ConversationState, input_data: Any) -> None:
+    """Open a ``subagent <agent_type>`` span and register it under ``agent_id``.
+
+    Sibling of ``execute_tool Agent`` (the parent's view of the Task tool)
+    rather than nested — ``SubagentStartHookInput`` carries no
+    ``tool_use_id`` so we can't reliably correlate to the right
+    ``execute_tool`` span without ordering heuristics.
+
+    Also captures the matching ``AgentDefinition`` metadata
+    (``model`` / ``description`` / ``tools`` / ``system_prompt`` etc.)
+    when ``options.agents[agent_type]`` is set — gives dashboards a way
+    to group subagents by configured model and audit the system prompt
+    that was in effect, without requiring a separate join.
+    """
+    if not isinstance(input_data, dict):  # pragma: no cover
+        return
+    agent_id = input_data.get('agent_id')
+    agent_type = input_data.get('agent_type') or ''
+    if not agent_id:  # pragma: no cover  # shouldn't happen — both are required by SDK type
+        return
+    # Increment AFTER the validation guards — a malformed event that
+    # bails before opening the span shouldn't bump the count.
+    state.subagent_count += 1
+
+    attrs: dict[str, Any] = {
+        AGENT_NAME: agent_type,
+        CLAUDE_AGENT_ID: agent_id,
+        CLAUDE_AGENT_TYPE: agent_type,
+        **_hook_session_id(input_data),
+        **_subagent_definition_attrs(state.options, agent_type),
+    }
+
+    # Open the span under the active OTel context (which is the root
+    # ``invoke_agent`` thanks to ``_run_hook``'s ``_attach_root_context``).
+    # Explicit ``'subagent {agent_type}'`` template (rather than an
+    # f-string) matches the ``Hook: PreCompact ({trigger})`` /
+    # ``Hook: PermissionResult ({behavior})`` precedent and avoids
+    # logfire's f-string introspection auto-extracting a bare
+    # ``agent_type`` attribute alongside the namespaced ``claude.agent_type``.
+    span = state.logfire.span('subagent {agent_type}', agent_type=agent_type, **attrs)
+    span._start()  # pyright: ignore[reportPrivateUsage]
+    state.subagent_spans[agent_id] = span
+
+
+def _subagent_definition_attrs(options: Any, agent_type: str) -> dict[str, Any]:
+    """Extract ``AgentDefinition`` metadata for the ``subagent`` span (issue #3).
+
+    Mirrors the ``_options_attrs`` precedent from #8: defensive
+    ``isinstance`` guard on ``options`` itself so duck-typed mocks don't
+    ship garbage; ``isinstance`` guard on the per-agent definition so
+    SimpleNamespace-shaped fakes are rejected; only emits fields that are
+    explicitly set.
+
+    AgentDefinition fields captured (8 of 13 SDK fields):
+      * ``description`` / ``prompt`` (→ ``claude.agent.system_prompt``) /
+        ``initialPrompt`` / ``model`` / ``memory`` / ``background`` —
+        scalars under ``claude.agent.*``.
+      * ``tools`` / ``disallowedTools`` / ``skills`` — lists, emitted
+        when non-empty.
+      * ``permissionMode`` / ``maxTurns`` / ``effort`` — reuse the
+        existing ``CLAUDE_PERMISSION_MODE`` / ``CLAUDE_MAX_TURNS`` /
+        ``CLAUDE_EFFORT`` constants from #8 (same configuration concepts;
+        span_name distinguishes parent-options from subagent-definition
+        in dashboards).
+
+    Deferred:
+      * ``mcpServers`` — potentially-large nested config dict; needs its
+        own extractor with name-only / structure-only modes.
+
+    Returns ``{}`` when ``options`` is None or not a recognisable
+    ``ClaudeAgentOptions``, when ``options.agents`` isn't a dict, or when
+    ``agents[agent_type]`` isn't a recognisable ``AgentDefinition``.
+    """
+    if options is None or not isinstance(options, claude_agent_sdk.ClaudeAgentOptions):
+        return {}
+    agents = getattr(options, 'agents', None)
+    if not isinstance(agents, dict):
+        return {}
+    definition = agents.get(agent_type)
+    AgentDefinition = getattr(claude_agent_sdk, 'AgentDefinition', None)
+    if AgentDefinition is None or not isinstance(definition, AgentDefinition):
+        return {}
+
+    attrs: dict[str, Any] = {}
+    # Map AgentDefinition field → semconv constant. Note SDK's camelCase
+    # field names (``disallowedTools`` / ``initialPrompt`` / ``maxTurns`` /
+    # ``permissionMode``) — accessed via ``getattr`` since Python attribute
+    # lookup is case-sensitive. Surface under snake_case ``claude.*`` attrs.
+    scalar_map: tuple[tuple[str, str], ...] = (
+        ('model', CLAUDE_AGENT_MODEL),
+        ('description', CLAUDE_AGENT_DESCRIPTION),
+        ('prompt', CLAUDE_AGENT_SYSTEM_PROMPT),
+        ('initialPrompt', CLAUDE_AGENT_INITIAL_PROMPT),
+        ('memory', CLAUDE_AGENT_MEMORY),
+        ('background', CLAUDE_AGENT_BACKGROUND),
+        # Re-use of #8's constants: same configuration concepts.
+        ('permissionMode', CLAUDE_PERMISSION_MODE),
+        ('maxTurns', CLAUDE_MAX_TURNS),
+        ('effort', CLAUDE_EFFORT),
+    )
+    for src, dst in scalar_map:
+        if (value := getattr(definition, src, None)) is not None:
+            attrs[dst] = value
+    # Lists — emit when non-empty.
+    list_map: tuple[tuple[str, str], ...] = (
+        ('tools', CLAUDE_AGENT_TOOLS),
+        ('disallowedTools', CLAUDE_AGENT_DISALLOWED_TOOLS),
+        ('skills', CLAUDE_AGENT_SKILLS),
+    )
+    for src, dst in list_map:
+        if value := getattr(definition, src, None):
+            attrs[dst] = list(value)
+    return attrs
+
+
+def _record_subagent_stop(state: _ConversationState, input_data: Any) -> None:
+    """Close the matching ``subagent`` span (issue #3).
+
+    The span envelope is the event record; no separate log is emitted.
+    See ``subagent_stop_hook``'s docstring for rationale.
+
+    Captures the undocumented-but-on-the-wire ``last_assistant_message``
+    field defensively — same forward-compat pattern as the regular ``Stop``
+    hook from #9.
+    """
+    if not isinstance(input_data, dict):  # pragma: no cover
+        return
+    agent_id = input_data.get('agent_id')
+    if not agent_id:  # pragma: no cover
+        return
+
+    span = state.subagent_spans.pop(agent_id, None)
+    last_assistant_message = input_data.get('last_assistant_message')
+    transcript_path = input_data.get('agent_transcript_path')
+
+    if span is not None:
+        if last_assistant_message is not None:
+            span.set_attribute(CLAUDE_SUBAGENT_LAST_ASSISTANT_MESSAGE, last_assistant_message)
+        if transcript_path is not None:
+            span.set_attribute(CLAUDE_AGENT_TRANSCRIPT_PATH, str(transcript_path))
+        span._end()  # pyright: ignore[reportPrivateUsage]
+
+
+def _record_task_started(state: _ConversationState, msg: Any) -> None:
+    """Record a ``TaskStartedMessage`` as an info log under the active span.
+
+    Carries the parent's ``tool_use_id`` (the Task tool call's id) so
+    downstream queries can join Task lifecycle events to the parent's
+    ``execute_tool`` span via ``gen_ai.tool.call.id``.
+    """
+    attrs = _msg_attrs(msg, (
+        ('task_id', CLAUDE_TASK_ID),
+        ('description', CLAUDE_TASK_DESCRIPTION),
+        ('task_type', CLAUDE_TASK_TYPE),
+        ('tool_use_id', TOOL_CALL_ID),
+    ))
+    state.logfire.info('Task started', **attrs)
+
+
+def _record_task_progress(state: _ConversationState, msg: Any) -> None:
+    """Record a ``TaskProgressMessage`` as an info log.
+
+    Typically only fires for long-running / background subagents — foreground
+    subagents (e.g. fast Task dispatches that finish in milliseconds) skip
+    progress and go straight from start to notification.
+    """
+    attrs = _msg_attrs(msg, (
+        ('task_id', CLAUDE_TASK_ID),
+        ('description', CLAUDE_TASK_DESCRIPTION),
+        ('last_tool_name', CLAUDE_TASK_LAST_TOOL_NAME),
+        ('tool_use_id', TOOL_CALL_ID),
+        ('usage', CLAUDE_TASK_USAGE),
+    ))
+    state.logfire.info('Task progress', **attrs)
+
+
+def _record_task_notification(state: _ConversationState, msg: Any) -> None:
+    """Record a ``TaskNotificationMessage`` as a level-appropriate log.
+
+    ``status='completed'`` → info, ``'stopped'`` → warn, ``'failed'`` →
+    error. Carries the final ``summary`` and ``output_file`` plus optional
+    ``usage``. Does NOT escalate the parent ``invoke_agent`` span on
+    ``failed`` — the parent isn't logically failed, just the subagent;
+    operators can filter by ``claude.task.status`` for failure dashboards.
+    """
+    status = getattr(msg, 'status', None)
+    attrs = _msg_attrs(msg, (
+        ('task_id', CLAUDE_TASK_ID),
+        ('status', CLAUDE_TASK_STATUS),
+        ('summary', CLAUDE_TASK_SUMMARY),
+        ('output_file', CLAUDE_TASK_OUTPUT_FILE),
+        ('tool_use_id', TOOL_CALL_ID),
+        ('usage', CLAUDE_TASK_USAGE),
+    ))
+
+    log = state.logfire.info
+    if status == 'failed':
+        log = state.logfire.error
+    elif status == 'stopped':
+        log = state.logfire.warn
+    log('Task {status}', status=status or 'unknown', **attrs)
+
+
+def _msg_session_id(msg: Any) -> dict[str, Any]:
+    """Extract ``session_id`` from a Task* message dataclass under the OTel
+    semconv ``gen_ai.conversation.id`` key. Returns ``{}`` when absent so
+    callers can splat unconditionally.
+    """
+    sid = getattr(msg, 'session_id', None)
+    return {CONVERSATION_ID: sid} if sid else {}
+
+
+def _msg_attrs(msg: Any, field_map: tuple[tuple[str, str], ...]) -> dict[str, Any]:
+    """Build a Task* log attrs dict: session id seed plus every mapped field
+    that's set on ``msg`` (``is not None`` test so falsy-but-present values
+    like ``0`` survive).
+    """
+    attrs = _msg_session_id(msg)
+    for sdk_field, attr_name in field_map:
+        if (value := getattr(msg, sdk_field, None)) is not None:
+            attrs[attr_name] = value
+    return attrs

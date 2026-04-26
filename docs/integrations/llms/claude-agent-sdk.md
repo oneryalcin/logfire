@@ -130,6 +130,46 @@ These spans are top-level (no `invoke_agent` parent) when called between turns; 
 !!! note "`receive_messages` and the break-without-aclose edge case"
     `receive_messages` has no auto-stop sentinel, so the user must `break` to leave the loop. If the loop breaks without explicitly calling `await iter.aclose()` or using `async with closing(...)`, Python may not run the wrapper's `finally` block immediately — the OTel context for `invoke_agent` stays active until garbage collection runs, and any operations called between break and aclose (including `__aexit__`'s implicit `disconnect`) will parent to the stale `invoke_agent`. Doesn't affect `receive_response` (which auto-stops cleanly at `ResultMessage`). For `receive_messages`, prefer `async with contextlib.aclosing(client.receive_messages()) as it: ...` if you break early.
 
+## Subagent observability
+
+When the Claude CLI spawns a subagent via the Task tool, the integration opens a `subagent {agent_type}` child span under `invoke_agent` keyed by `agent_id` (`SubagentStart` hook). The span closes on the matching `SubagentStop`, and tool calls fired inside the subagent context re-parent their `execute_tool` child spans under the subagent span rather than the root `invoke_agent`. The trace tree looks like:
+
+```
+invoke_agent                      (root, parent thread)
+├── chat claude-sonnet-4-6        (parent's turn that emits the Task tool call)
+├── execute_tool Agent            (parent's view of the Task tool — current SDK
+│                                  surfaces the Task tool as 'Agent')
+├── subagent echo-helper          (sibling of execute_tool Agent)
+│   └── execute_tool Bash         (subagent's tool call, re-parented via agent_id)
+├── Task started                  (log under invoke_agent, info)
+├── Task progress                 (log; only fires for tool-using or background subagents)
+├── Task completed                (log; level depends on status)
+└── chat claude-sonnet-4-6        (parent's continuation)
+```
+
+Subagent attribution carried on the span:
+
+- `gen_ai.agent.name`, `claude.agent_id` (SDK-generated, opaque), `claude.agent_type` — the disambiguators when multiple subagents run in parallel.
+- `claude.subagent.last_assistant_message` — the verbatim final subagent text (allowlisted from scrubbing — model-generated content, mirrors `claude.stop.last_assistant_message`).
+- `claude.agent.transcript_path` — the subagent's own transcript JSONL, distinct from the parent session's.
+- When `ClaudeAgentOptions.agents[agent_type]` is configured (custom subagent definition), the full `AgentDefinition` metadata: `claude.agent.model`, `.description`, `.system_prompt` (from `AgentDefinition.prompt`, allowlisted), `.initial_prompt` (allowlisted), `.tools`, `.disallowed_tools`, `.skills`, `.memory`, `.background`, plus `claude.permission_mode` / `claude.max_turns` / `claude.effort` (re-using #8's constants — same configuration concepts; `span_name` distinguishes parent-options from subagent-definition values in dashboards).
+
+Three system-message events emitted during the subagent run surface as logs under `invoke_agent`:
+
+- **`Task started`** (info): carries `claude.task_id`, `claude.task.description`, `claude.task.type`, plus `gen_ai.tool.call.id` (the parent's Task tool id — for cross-span correlation).
+- **`Task progress`** (info): carries `claude.task.usage` (a TaskUsage dict — `total_tokens` / `tool_uses` / `duration_ms`) and `claude.task.last_tool_name`. Typically only fires for long-running / tool-using subagents; pure-text foreground subagents go straight from started to notification.
+- **`Task {status}`** (level depends on status): `completed` → info, `stopped` → warn, `failed` → error. Carries `claude.task.summary` (allowlisted — model-generated end-of-task text), `claude.task.output_file`, optional `claude.task.usage`. Does NOT escalate the parent `invoke_agent` span on `failed` — the parent isn't logically failed, just the subagent.
+
+`claude.subagent_count` lands on the root `invoke_agent` at conversation close (mirrors `claude.tools_used`), giving dashboards a per-session subagent-spawn count.
+
+### Parallel subagents
+
+Multiple Task dispatches in a single parent turn produce multiple concurrent `subagent` spans, each keyed by its own `agent_id`. The integration's per-conversation `subagent_spans` dict disambiguates by `agent_id`, so each subagent's tool calls correctly nest under its own span even when their hook callbacks interleave over the SDK's control channel.
+
+### Known limitation: subagent chat spans flatten under invoke_agent
+
+Subagent assistant turns produce `chat` spans flat under `invoke_agent` rather than nested under their parent `subagent` span. The dispatch loop's `handle_assistant_message` / `handle_user_message` don't have `agent_id` available — only `parent_tool_use_id`. Cross-correlation is still possible via the `claude.parent_tool_use_id` attribute already captured on each chat span, joined to the parent's `execute_tool Agent` span via `gen_ai.tool.call.id`. Fully nesting subagent chat spans under the subagent span requires building a `parent_tool_use_id → agent_id` map and refactoring `_ConversationState`'s span lifecycle; tracked separately to land with dedicated design + review attention.
+
 ## End-of-conversation result fields
 
 The `invoke_agent` span carries the conversation-level summary extracted from `ResultMessage`:
