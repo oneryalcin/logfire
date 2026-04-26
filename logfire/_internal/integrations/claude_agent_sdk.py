@@ -21,17 +21,6 @@ from claude_agent_sdk import (
     UserMessage,
 )
 from claude_agent_sdk.types import HookContext, SyncHookJSONOutput
-
-# Optional message types — resolved at module load from the installed SDK so
-# older versions that lack them still import cleanly. Using getattr avoids
-# a redundant try/except on a module we've already imported above.
-RateLimitEvent = getattr(claude_agent_sdk, 'RateLimitEvent', None)
-MirrorErrorMessage = getattr(claude_agent_sdk, 'MirrorErrorMessage', None)
-# Issue #3 — Task* SystemMessage subclasses for subagent dispatch.
-TaskStartedMessage = getattr(claude_agent_sdk, 'TaskStartedMessage', None)
-TaskProgressMessage = getattr(claude_agent_sdk, 'TaskProgressMessage', None)
-TaskNotificationMessage = getattr(claude_agent_sdk, 'TaskNotificationMessage', None)
-
 from opentelemetry import context as context_api, trace as trace_api
 
 from logfire._internal.integrations.llm_providers.semconv import (
@@ -60,9 +49,9 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_EFFORT,
     CLAUDE_ENABLE_FILE_CHECKPOINTING,
     CLAUDE_FORK_ON_RESUME,
-    CLAUDE_INCLUDE_PARTIAL_MESSAGES,
     CLAUDE_IN_SUBAGENT_AGENT_ID,
     CLAUDE_IN_SUBAGENT_AGENT_TYPE,
+    CLAUDE_INCLUDE_PARTIAL_MESSAGES,
     CLAUDE_MAX_BUDGET_USD,
     CLAUDE_MAX_TURNS,
     CLAUDE_MCP_ENABLED,
@@ -148,11 +137,20 @@ from logfire._internal.integrations.llm_providers.semconv import (
 )
 from logfire._internal.utils import handle_internal_errors
 
+# Optional message types — resolved at module load from the installed SDK so
+# older versions that lack them still import cleanly. Using getattr avoids
+# a redundant try/except on a module we've already imported above.
+RateLimitEvent = getattr(claude_agent_sdk, 'RateLimitEvent', None)
+MirrorErrorMessage = getattr(claude_agent_sdk, 'MirrorErrorMessage', None)
+# Issue #3 — Task* SystemMessage subclasses for subagent dispatch.
+TaskStartedMessage = getattr(claude_agent_sdk, 'TaskStartedMessage', None)
+TaskProgressMessage = getattr(claude_agent_sdk, 'TaskProgressMessage', None)
+TaskNotificationMessage = getattr(claude_agent_sdk, 'TaskNotificationMessage', None)
+
 if TYPE_CHECKING:
     # String forward refs for the SDK types that may be absent at runtime on
     # older SDK versions (see getattr above).
-    from claude_agent_sdk import MirrorErrorMessage as _MirrorErrorMessage
-    from claude_agent_sdk import RateLimitEvent as _RateLimitEvent
+    from claude_agent_sdk import MirrorErrorMessage as _MirrorErrorMessage, RateLimitEvent as _RateLimitEvent
 
     from logfire._internal.main import Logfire, LogfireSpan
 
@@ -353,7 +351,7 @@ def _options_attrs(options: Any) -> dict[str, Any]:
     # reprs into the attribute.
     agents = getattr(options, 'agents', None)
     if isinstance(agents, dict) and agents:
-        attrs[CLAUDE_AGENTS] = sorted(agents.keys())
+        attrs[CLAUDE_AGENTS] = sorted(cast('dict[str, Any]', agents).keys())
 
     return attrs
 
@@ -363,7 +361,7 @@ def _options_attrs(options: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _tool_parent_otel_span(state: _ConversationState, input_data: Any) -> Any:
+def _tool_parent_otel_span(state: _ConversationState, input_data: dict[str, Any]) -> Any:
     """Return the OTel span the ``execute_tool`` should parent under (issue #3).
 
     When the tool-lifecycle hook fires inside a subagent context (``agent_id``
@@ -374,12 +372,11 @@ def _tool_parent_otel_span(state: _ConversationState, input_data: Any) -> Any:
     Returns ``None`` if no usable parent OTel span is available (root span
     already ended); caller should noop.
     """
-    if isinstance(input_data, dict):
-        agent_id = input_data.get('agent_id')
-        if agent_id and (subagent_span := state.subagent_spans.get(agent_id)):
-            otel = subagent_span._span  # pyright: ignore[reportPrivateUsage]
-            if otel is not None:
-                return otel
+    agent_id = input_data.get('agent_id')
+    if agent_id and (subagent_span := state.subagent_spans.get(agent_id)):
+        otel = subagent_span._span  # pyright: ignore[reportPrivateUsage]
+        if otel is not None:
+            return otel
     return state.root_span._span  # pyright: ignore[reportPrivateUsage]
 
 
@@ -439,7 +436,7 @@ async def pre_tool_use_hook(
             # nested-dict mutations would silently miss the diff — revisit
             # with ``copy.deepcopy`` then.
             if isinstance(tool_input, dict):
-                state.original_tool_inputs[tool_use_id] = dict(tool_input)
+                state.original_tool_inputs[tool_use_id] = dict(cast('dict[str, Any]', tool_input))
         finally:
             context_api.detach(token)
 
@@ -474,11 +471,7 @@ async def post_tool_use_hook(
         # canonical attribute with the executed value and surface the
         # original under ``claude.tool_call.arguments.original``.
         executed_input = input_data.get('tool_input')
-        if (
-            isinstance(executed_input, dict)
-            and isinstance(original_input, dict)
-            and executed_input != original_input
-        ):
+        if isinstance(executed_input, dict) and isinstance(original_input, dict) and executed_input != original_input:
             span.set_attribute(TOOL_CALL_ARGUMENTS, executed_input)
             span.set_attribute(CLAUDE_TOOL_CALL_ARGUMENTS_ORIGINAL, original_input)
 
@@ -862,8 +855,6 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
                 yield msg
 
         cls.receive_messages = patched_receive_messages
-    else:  # pragma: no cover
-        patched_receive_messages = None
 
     # --- Patch connect / disconnect (issue #11) ---
     # Lifecycle spans capture CLI-startup latency (a real tail-latency
@@ -927,7 +918,9 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
     if original_toggle_mcp_server is not None:
 
         @functools.wraps(original_toggle_mcp_server)
-        async def patched_toggle_mcp_server(self: Any, server_name: str, enabled: bool, *args: Any, **kwargs: Any) -> Any:
+        async def patched_toggle_mcp_server(
+            self: Any, server_name: str, enabled: bool, *args: Any, **kwargs: Any
+        ) -> Any:
             with _traced_span(
                 logfire_claude,
                 'mcp.toggle',
@@ -1036,11 +1029,11 @@ def _make_control_patch(
 
 
 def _inject_tracing_hooks(options: Any) -> None:
-    """Inject logfire tracing hooks into ClaudeAgentOptions and wrap any
-    ``can_use_tool`` callback for outcome tracing (issue #10).
+    """Inject logfire tracing hooks into ClaudeAgentOptions.
 
-    Guards against duplicate injection / double-wrap when the same options
-    object is reused across multiple ClaudeSDKClient instances.
+    Also wraps any ``can_use_tool`` callback for outcome tracing (issue
+    #10). Guards against duplicate injection / double-wrap when the same
+    options object is reused across multiple ClaudeSDKClient instances.
     """
     if not hasattr(options, 'hooks'):
         return
@@ -1236,9 +1229,10 @@ class _ConversationState:
             self._current_output_parts = []
 
     def handle_user_message(self, message: UserMessage | None = None) -> None:
-        """Open a new chat span on UserMessage, re-parenting it under the
-        matching subagent envelope when the message originates inside one
-        (issue #26).
+        """Open a new chat span on UserMessage.
+
+        Re-parents under the matching subagent envelope when the message
+        originates inside one (issue #26).
 
         ``UserMessage.parent_tool_use_id`` is set when the SDK forwards a
         subagent's turn through the parent stream. ``open_chat_span``
@@ -1354,9 +1348,7 @@ class _ConversationState:
         self.parent_tool_use_id_to_agent_id.clear()
 
 
-def _record_rate_limit_event(
-    logfire_instance: Logfire, root_span: LogfireSpan, msg: _RateLimitEvent
-) -> None:
+def _record_rate_limit_event(logfire_instance: Logfire, root_span: LogfireSpan, msg: _RateLimitEvent) -> None:
     """Record a RateLimitEvent as a level-appropriate log under the root span.
 
     The SDK emits these whenever the CLI reports a rate-limit state transition
@@ -1409,6 +1401,7 @@ def _record_mirror_error(logfire_instance: Logfire, msg: _MirrorErrorMessage) ->
     attrs: dict[str, Any] = {ERROR_TYPE: 'MirrorError'}
     key = getattr(msg, 'key', None)
     if isinstance(key, dict):
+        key = cast('dict[str, Any]', key)
         if (sid := key.get('session_id')) is not None:
             attrs[CONVERSATION_ID] = sid
         if (pk := key.get('project_key')) is not None:
@@ -1481,16 +1474,17 @@ def _record_result(span: LogfireSpan, msg: ResultMessage) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _hook_session_id(input_data: Any) -> dict[str, Any]:
-    """Pull ``session_id`` from a hook input dict, mapped to the OTel semconv
-    ``gen_ai.conversation.id``. Returns ``{}`` when absent so callers can
-    splat it into a log call unconditionally.
+def _hook_session_id(input_data: dict[str, Any]) -> dict[str, Any]:
+    """Pull ``session_id`` from a hook input dict.
+
+    Mapped to the OTel semconv ``gen_ai.conversation.id``. Returns ``{}``
+    when absent so callers can splat it into a log call unconditionally.
     """
-    sid = (input_data or {}).get('session_id') if isinstance(input_data, dict) else None
+    sid = input_data.get('session_id')
     return {CONVERSATION_ID: sid} if sid else {}
 
 
-def _record_user_prompt_submit(state: _ConversationState, input_data: Any) -> None:
+def _record_user_prompt_submit(state: _ConversationState, input_data: dict[str, Any]) -> None:
     """Record a UserPromptSubmit hook event as an info log under the root span.
 
     ``claude.user_prompt`` is intentionally NOT on the scrubber's SAFE_KEYS:
@@ -1499,8 +1493,6 @@ def _record_user_prompt_submit(state: _ConversationState, input_data: Any) -> No
     can use a ``scrubbing_callback``.
     """
     state.user_prompt_count += 1
-    if not isinstance(input_data, dict):  # pragma: no cover
-        return
     prompt = input_data.get('prompt')
     attrs: dict[str, Any] = {**_hook_session_id(input_data)}
     if prompt is not None:
@@ -1508,7 +1500,7 @@ def _record_user_prompt_submit(state: _ConversationState, input_data: Any) -> No
     state.logfire.info('Hook: UserPromptSubmit', **attrs)
 
 
-def _record_stop(state: _ConversationState, input_data: Any) -> None:
+def _record_stop(state: _ConversationState, input_data: dict[str, Any]) -> None:
     """Record a Stop hook event as an info log under the root span.
 
     Captures ``last_assistant_message`` defensively via ``.get()`` —
@@ -1517,8 +1509,6 @@ def _record_stop(state: _ConversationState, input_data: Any) -> None:
     skip the attribute. Goes through the scrubber's SAFE_KEYS allowlist
     because it's model-generated text (mirrors ``claude.result.text``).
     """
-    if not isinstance(input_data, dict):  # pragma: no cover
-        return
     attrs: dict[str, Any] = {**_hook_session_id(input_data)}
     # Emit ``stop_hook_active`` only when True — almost always False.
     if input_data.get('stop_hook_active'):
@@ -1529,7 +1519,7 @@ def _record_stop(state: _ConversationState, input_data: Any) -> None:
     state.logfire.info('Hook: Stop', **attrs)
 
 
-def _record_pre_compact(state: _ConversationState, input_data: Any) -> None:
+def _record_pre_compact(state: _ConversationState, input_data: dict[str, Any]) -> None:
     """Record a PreCompact hook event as a warn log under the root span.
 
     Compaction is the strongest leading indicator that the session is
@@ -1537,8 +1527,6 @@ def _record_pre_compact(state: _ConversationState, input_data: Any) -> None:
     without being treated as a hard error.
     """
     state.compact_count += 1
-    if not isinstance(input_data, dict):  # pragma: no cover
-        return
     attrs: dict[str, Any] = {**_hook_session_id(input_data)}
     if (trigger := input_data.get('trigger')) is not None:
         attrs[CLAUDE_COMPACT_TRIGGER] = trigger
@@ -1547,7 +1535,7 @@ def _record_pre_compact(state: _ConversationState, input_data: Any) -> None:
     state.logfire.warn('Hook: PreCompact ({trigger})', trigger=attrs.get(CLAUDE_COMPACT_TRIGGER, ''), **attrs)
 
 
-def _record_notification(state: _ConversationState, input_data: Any) -> None:
+def _record_notification(state: _ConversationState, input_data: dict[str, Any]) -> None:
     """Record a Notification hook event as an info log under the root span.
 
     ``claude.notification.message`` is NOT on SAFE_KEYS: CLI-emitted text
@@ -1556,8 +1544,6 @@ def _record_notification(state: _ConversationState, input_data: Any) -> None:
     that may evolve.
     """
     state.notification_count += 1
-    if not isinstance(input_data, dict):  # pragma: no cover
-        return
     attrs: dict[str, Any] = {**_hook_session_id(input_data)}
     field_map: tuple[tuple[str, str], ...] = (
         ('message', CLAUDE_NOTIFICATION_MESSAGE),
@@ -1574,7 +1560,7 @@ def _record_notification(state: _ConversationState, input_data: Any) -> None:
     )
 
 
-def _record_permission_request(state: _ConversationState, input_data: Any) -> None:
+def _record_permission_request(state: _ConversationState, input_data: dict[str, Any]) -> None:
     """Record a PermissionRequest hook event as an info-level audit log.
 
     Captures ``agent_id`` / ``agent_type`` opportunistically when the
@@ -1585,8 +1571,6 @@ def _record_permission_request(state: _ConversationState, input_data: Any) -> No
     NOT on SAFE_KEYS, matching the ``claude.permission_denials`` precedent.
     """
     state.permission_request_count += 1
-    if not isinstance(input_data, dict):  # pragma: no cover
-        return
     attrs: dict[str, Any] = {**_hook_session_id(input_data)}
     field_map: tuple[tuple[str, str], ...] = (
         ('tool_name', TOOL_NAME),
@@ -1684,8 +1668,7 @@ def _record_permission_result(
             # wire boundary in query.py).
             try:
                 attrs[CLAUDE_PERMISSION_RESULT_UPDATED_PERMISSIONS] = [
-                    p.to_dict() if hasattr(p, 'to_dict') else p
-                    for p in updated_permissions
+                    p.to_dict() if hasattr(p, 'to_dict') else p for p in updated_permissions
                 ]
             except Exception:  # pragma: no cover  # forward-compat: skip bad shape
                 pass
@@ -1698,8 +1681,10 @@ def _record_permission_result(
 
 
 def _wrap_can_use_tool(callback: Any) -> Any:
-    """Wrap a user-supplied ``can_use_tool`` callback so each invocation is
-    surfaced as a logfire log under the active ``invoke_agent`` span.
+    """Wrap a user-supplied ``can_use_tool`` callback for outcome tracing.
+
+    Each invocation is surfaced as a logfire log under the active
+    ``invoke_agent`` span.
 
     Idempotent: calling on an already-wrapped callable is a no-op (returns
     the same wrapper). Used by ``_inject_tracing_hooks`` to avoid double-
@@ -1749,7 +1734,7 @@ def _wrap_can_use_tool(callback: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _record_subagent_start(state: _ConversationState, input_data: Any) -> None:
+def _record_subagent_start(state: _ConversationState, input_data: dict[str, Any]) -> None:
     """Open a ``subagent <agent_type>`` span and register it under ``agent_id``.
 
     Sibling of ``execute_tool Agent`` (the parent's view of the Task tool)
@@ -1763,8 +1748,6 @@ def _record_subagent_start(state: _ConversationState, input_data: Any) -> None:
     to group subagents by configured model and audit the system prompt
     that was in effect, without requiring a separate join.
     """
-    if not isinstance(input_data, dict):  # pragma: no cover
-        return
     agent_id = input_data.get('agent_id')
     agent_type = input_data.get('agent_type') or ''
     if not agent_id:  # pragma: no cover  # shouldn't happen — both are required by SDK type
@@ -1827,6 +1810,7 @@ def _subagent_definition_attrs(options: Any, agent_type: str) -> dict[str, Any]:
     agents = getattr(options, 'agents', None)
     if not isinstance(agents, dict):
         return {}
+    agents = cast('dict[str, Any]', agents)
     definition = agents.get(agent_type)
     AgentDefinition = getattr(claude_agent_sdk, 'AgentDefinition', None)
     if AgentDefinition is None or not isinstance(definition, AgentDefinition):
@@ -1864,7 +1848,7 @@ def _subagent_definition_attrs(options: Any, agent_type: str) -> dict[str, Any]:
     return attrs
 
 
-def _record_subagent_stop(state: _ConversationState, input_data: Any) -> None:
+def _record_subagent_stop(state: _ConversationState, input_data: dict[str, Any]) -> None:
     """Close the matching ``subagent`` span (issue #3).
 
     The span envelope is the event record; no separate log is emitted.
@@ -1874,8 +1858,6 @@ def _record_subagent_stop(state: _ConversationState, input_data: Any) -> None:
     field defensively — same forward-compat pattern as the regular ``Stop``
     hook from #9.
     """
-    if not isinstance(input_data, dict):  # pragma: no cover
-        return
     agent_id = input_data.get('agent_id')
     if not agent_id:  # pragma: no cover
         return
@@ -1886,9 +1868,7 @@ def _record_subagent_stop(state: _ConversationState, input_data: Any) -> None:
     # ptui (rare — would imply SDK out-of-order delivery) degrade safely:
     # the lookup misses and the chat span parents under root.
     state.parent_tool_use_id_to_agent_id = {
-        ptui: aid
-        for ptui, aid in state.parent_tool_use_id_to_agent_id.items()
-        if aid != agent_id
+        ptui: aid for ptui, aid in state.parent_tool_use_id_to_agent_id.items() if aid != agent_id
     }
     last_assistant_message = input_data.get('last_assistant_message')
     transcript_path = input_data.get('agent_transcript_path')
@@ -1914,12 +1894,15 @@ def _record_task_started(state: _ConversationState, msg: Any) -> None:
     ``task_id == agent_id`` equality (verified in recon for sequential and
     interleaved-parallel dispatches).
     """
-    attrs = _msg_attrs(msg, (
-        ('task_id', CLAUDE_TASK_ID),
-        ('description', CLAUDE_TASK_DESCRIPTION),
-        ('task_type', CLAUDE_TASK_TYPE),
-        ('tool_use_id', TOOL_CALL_ID),
-    ))
+    attrs = _msg_attrs(
+        msg,
+        (
+            ('task_id', CLAUDE_TASK_ID),
+            ('description', CLAUDE_TASK_DESCRIPTION),
+            ('task_type', CLAUDE_TASK_TYPE),
+            ('tool_use_id', TOOL_CALL_ID),
+        ),
+    )
     tool_use_id = getattr(msg, 'tool_use_id', None)
     task_id = getattr(msg, 'task_id', None)
     if tool_use_id and task_id:
@@ -1934,13 +1917,16 @@ def _record_task_progress(state: _ConversationState, msg: Any) -> None:
     subagents (e.g. fast Task dispatches that finish in milliseconds) skip
     progress and go straight from start to notification.
     """
-    attrs = _msg_attrs(msg, (
-        ('task_id', CLAUDE_TASK_ID),
-        ('description', CLAUDE_TASK_DESCRIPTION),
-        ('last_tool_name', CLAUDE_TASK_LAST_TOOL_NAME),
-        ('tool_use_id', TOOL_CALL_ID),
-        ('usage', CLAUDE_TASK_USAGE),
-    ))
+    attrs = _msg_attrs(
+        msg,
+        (
+            ('task_id', CLAUDE_TASK_ID),
+            ('description', CLAUDE_TASK_DESCRIPTION),
+            ('last_tool_name', CLAUDE_TASK_LAST_TOOL_NAME),
+            ('tool_use_id', TOOL_CALL_ID),
+            ('usage', CLAUDE_TASK_USAGE),
+        ),
+    )
     state.logfire.info('Task progress', **attrs)
 
 
@@ -1954,14 +1940,17 @@ def _record_task_notification(state: _ConversationState, msg: Any) -> None:
     operators can filter by ``claude.task.status`` for failure dashboards.
     """
     status = getattr(msg, 'status', None)
-    attrs = _msg_attrs(msg, (
-        ('task_id', CLAUDE_TASK_ID),
-        ('status', CLAUDE_TASK_STATUS),
-        ('summary', CLAUDE_TASK_SUMMARY),
-        ('output_file', CLAUDE_TASK_OUTPUT_FILE),
-        ('tool_use_id', TOOL_CALL_ID),
-        ('usage', CLAUDE_TASK_USAGE),
-    ))
+    attrs = _msg_attrs(
+        msg,
+        (
+            ('task_id', CLAUDE_TASK_ID),
+            ('status', CLAUDE_TASK_STATUS),
+            ('summary', CLAUDE_TASK_SUMMARY),
+            ('output_file', CLAUDE_TASK_OUTPUT_FILE),
+            ('tool_use_id', TOOL_CALL_ID),
+            ('usage', CLAUDE_TASK_USAGE),
+        ),
+    )
 
     log = state.logfire.info
     if status == 'failed':
@@ -1972,18 +1961,20 @@ def _record_task_notification(state: _ConversationState, msg: Any) -> None:
 
 
 def _msg_session_id(msg: Any) -> dict[str, Any]:
-    """Extract ``session_id`` from a Task* message dataclass under the OTel
-    semconv ``gen_ai.conversation.id`` key. Returns ``{}`` when absent so
-    callers can splat unconditionally.
+    """Extract ``session_id`` from a Task* message dataclass.
+
+    Mapped under the OTel semconv ``gen_ai.conversation.id`` key. Returns
+    ``{}`` when absent so callers can splat unconditionally.
     """
     sid = getattr(msg, 'session_id', None)
     return {CONVERSATION_ID: sid} if sid else {}
 
 
 def _msg_attrs(msg: Any, field_map: tuple[tuple[str, str], ...]) -> dict[str, Any]:
-    """Build a Task* log attrs dict: session id seed plus every mapped field
-    that's set on ``msg`` (``is not None`` test so falsy-but-present values
-    like ``0`` survive).
+    """Build a Task* log attrs dict.
+
+    Session id seed plus every mapped field that's set on ``msg``
+    (``is not None`` test so falsy-but-present values like ``0`` survive).
     """
     attrs = _msg_session_id(msg)
     for sdk_field, attr_name in field_map:

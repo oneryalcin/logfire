@@ -20,6 +20,7 @@ import stat
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -43,7 +44,7 @@ from claude_agent_sdk import (
     UserMessage,
 )
 from claude_agent_sdk._errors import CLINotFoundError, ProcessError
-from claude_agent_sdk.types import HookContext
+from claude_agent_sdk.types import HookContext, HookEvent
 from dirty_equals import IsStr
 from inline_snapshot import snapshot
 
@@ -680,7 +681,7 @@ def test_server_tool_result_persists_under_assistant_role_in_history() -> None:
 
         # After close, history should carry the assistant turn with both the
         # tool_call and the tool_call_response parts under role='assistant'.
-        history = state._history  # pyright: ignore[reportPrivateUsage]
+        history = state._history
         assert len(history) == 1
         turn = history[0]
         assert turn['role'] == 'assistant'
@@ -1021,7 +1022,7 @@ def test_inject_hooks_none_hooks() -> None:
     options = ClaudeAgentOptions(hooks=None)
     _inject_tracing_hooks(options)
     assert options.hooks is not None
-    expected_events = {
+    expected_events: set[HookEvent] = {
         'PreToolUse',
         'PostToolUse',
         'PostToolUseFailure',
@@ -1060,8 +1061,13 @@ def test_inject_hooks_with_existing_events() -> None:
     # New non-tool-lifecycle events are added too, even though Opts didn't
     # declare them.
     for event in (
-        'UserPromptSubmit', 'Stop', 'PreCompact', 'Notification',
-        'PermissionRequest', 'SubagentStart', 'SubagentStop',
+        'UserPromptSubmit',
+        'Stop',
+        'PreCompact',
+        'Notification',
+        'PermissionRequest',
+        'SubagentStart',
+        'SubagentStop',
     ):
         assert event in options.hooks
         assert len(options.hooks[event]) == 1
@@ -1547,7 +1553,7 @@ async def test_record_permission_result_deny_ends_open_execute_tool_span_promptl
         # Mimic ``pre_tool_use_hook`` having opened the execute_tool span
         # AND populated the diff snapshot — both should be cleaned up.
         tool_span = logfire_instance.span('execute_tool WebFetch')
-        tool_span._start()  # type: ignore[attr-defined]
+        tool_span._start()
         state.active_tool_spans['t3'] = tool_span
         state.original_tool_inputs['t3'] = {'url': 'https://example.com/'}
         _record_permission_result(
@@ -1561,8 +1567,8 @@ async def test_record_permission_result_deny_ends_open_execute_tool_span_promptl
         assert 't3' not in state.original_tool_inputs
         # Span end was triggered by the helper, not by ``state.close()``.
         # ``_end`` is idempotent so a later ``state.close()`` is harmless.
-        assert tool_span._span is not None  # type: ignore[attr-defined]
-        assert tool_span._span.end_time is not None  # type: ignore[attr-defined]
+        assert tool_span._span is not None
+        assert tool_span._span.end_time is not None
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     tool = next(s for s in spans if s['name'] == 'execute_tool WebFetch')
@@ -1768,7 +1774,7 @@ def _make_dummy_client() -> ClaudeSDKClient:
     client = ClaudeSDKClient(options=ClaudeAgentOptions())
     # Bypass ``connect`` — populate ``_query`` directly so the control
     # methods' "Not connected" guards pass.
-    client._query = _StubQuery()  # type: ignore[assignment]
+    client._query = _StubQuery()
     client._transport = Mock()
     return client
 
@@ -1920,7 +1926,7 @@ async def test_set_permission_mode_captures_mode(exporter: TestExporter) -> None
     ``CLAUDE_PERMISSION_MODE`` constant from the options-side capture
     in #8."""
     client = _make_dummy_client()
-    await client.set_permission_mode('acceptEdits')  # type: ignore[arg-type]
+    await client.set_permission_mode('acceptEdits')
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     s = next(s for s in spans if s['name'] == 'set_permission_mode')
@@ -2212,15 +2218,15 @@ async def test_tool_parent_otel_span_picks_subagent_when_agent_id_present(export
         # Subagent context — should return subagent's OTel span.
         sub_otel = _tool_parent_otel_span(state, {'agent_id': 'agent_A', 'tool_name': 'Bash'})
         assert sub_otel is not None
-        assert sub_otel is state.subagent_spans['agent_A']._span  # type: ignore[attr-defined]
+        assert sub_otel is state.subagent_spans['agent_A']._span
 
         # No agent_id — main thread; should return root.
         root_otel = _tool_parent_otel_span(state, {'tool_name': 'Bash'})
-        assert root_otel is state.root_span._span  # type: ignore[attr-defined]
+        assert root_otel is state.root_span._span
 
         # agent_id present but no matching subagent span (defensive) → root.
         unknown = _tool_parent_otel_span(state, {'agent_id': 'unknown_agent', 'tool_name': 'Bash'})
-        assert unknown is state.root_span._span  # type: ignore[attr-defined]
+        assert unknown is state.root_span._span
 
         _record_subagent_stop(state, {'agent_id': 'agent_A', 'agent_type': 'helper'})
 
@@ -2348,28 +2354,52 @@ async def test_three_parallel_subagents_each_tool_lands_under_correct_span(expor
             # Interleaved tool calls — each carries its own agent_id.
             await pre_tool_use_hook(
                 {'tool_name': 'Read', 'tool_input': {}, 'tool_use_id': 'tu_A1', 'agent_id': 'A_id'},
-                'tu_A1', ctx,
+                'tu_A1',
+                ctx,
             )
             await pre_tool_use_hook(
                 {'tool_name': 'Bash', 'tool_input': {}, 'tool_use_id': 'tu_C1', 'agent_id': 'C_id'},
-                'tu_C1', ctx,
+                'tu_C1',
+                ctx,
             )
             await pre_tool_use_hook(
                 {'tool_name': 'Grep', 'tool_input': {}, 'tool_use_id': 'tu_B1', 'agent_id': 'B_id'},
-                'tu_B1', ctx,
+                'tu_B1',
+                ctx,
             )
             # Posts in different order from pre.
             await post_tool_use_hook(
-                {'tool_name': 'Bash', 'tool_input': {}, 'tool_response': 'x', 'tool_use_id': 'tu_C1', 'agent_id': 'C_id'},
-                'tu_C1', ctx,
+                {
+                    'tool_name': 'Bash',
+                    'tool_input': {},
+                    'tool_response': 'x',
+                    'tool_use_id': 'tu_C1',
+                    'agent_id': 'C_id',
+                },
+                'tu_C1',
+                ctx,
             )
             await post_tool_use_hook(
-                {'tool_name': 'Read', 'tool_input': {}, 'tool_response': 'x', 'tool_use_id': 'tu_A1', 'agent_id': 'A_id'},
-                'tu_A1', ctx,
+                {
+                    'tool_name': 'Read',
+                    'tool_input': {},
+                    'tool_response': 'x',
+                    'tool_use_id': 'tu_A1',
+                    'agent_id': 'A_id',
+                },
+                'tu_A1',
+                ctx,
             )
             await post_tool_use_hook(
-                {'tool_name': 'Grep', 'tool_input': {}, 'tool_response': 'x', 'tool_use_id': 'tu_B1', 'agent_id': 'B_id'},
-                'tu_B1', ctx,
+                {
+                    'tool_name': 'Grep',
+                    'tool_input': {},
+                    'tool_response': 'x',
+                    'tool_use_id': 'tu_B1',
+                    'agent_id': 'B_id',
+                },
+                'tu_B1',
+                ctx,
             )
 
             # Stops in different order from starts (B finishes first, then A, then C).
@@ -2502,7 +2532,7 @@ async def test_three_parallel_subagents_chat_spans_attribute_correctly(exporter:
         annotated_agent_id = c['attributes']['claude.in_subagent.agent_id']
         assert c['parent']['span_id'] == by_agent_id[annotated_agent_id]['context']['span_id'], (
             f'chat span annotated with agent_id={annotated_agent_id} parented under '
-            f"span_id={c['parent']['span_id']}, expected {by_agent_id[annotated_agent_id]['context']['span_id']}"
+            f'span_id={c["parent"]["span_id"]}, expected {by_agent_id[annotated_agent_id]["context"]["span_id"]}'
         )
 
 
@@ -2602,7 +2632,9 @@ def test_subagent_stop_clears_parent_tool_use_id_to_agent_id_entries() -> None:
         _record_task_started(state, _task_started_msg(task_id='B_id', tool_use_id='tu_B1'))
 
         assert state.parent_tool_use_id_to_agent_id == {
-            'tu_A1': 'A_id', 'tu_A2': 'A_id', 'tu_B1': 'B_id',
+            'tu_A1': 'A_id',
+            'tu_A2': 'A_id',
+            'tu_B1': 'B_id',
         }
 
         _record_subagent_stop(state, {'agent_id': 'A_id', 'agent_type': 'reviewer'})
@@ -3860,7 +3892,7 @@ async def test_rate_limit_rejected_sets_error_level(exporter: TestExporter) -> N
             ),
             session_id='sess-abc',
         )
-        _record_rate_limit_event(logfire_instance, root, msg)
+        _record_rate_limit_event(logfire_instance, root, msg)  # pyright: ignore[reportArgumentType]
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     log_spans = [s for s in spans if s['name'] == 'rate_limit {status}']
@@ -3880,7 +3912,7 @@ async def test_mirror_error_without_key(exporter: TestExporter) -> None:
     """MirrorErrorMessage with key=None (not every mirror error has one)."""
     logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
     with logfire_instance.span('invoke_agent'):
-        _record_mirror_error(logfire_instance, SimpleNamespace(error='oh no', key=None))
+        _record_mirror_error(logfire_instance, SimpleNamespace(error='oh no', key=None))  # pyright: ignore[reportArgumentType]
 
     spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
     mirror = next(s for s in spans if s['name'] == 'mirror store error: {error}')
