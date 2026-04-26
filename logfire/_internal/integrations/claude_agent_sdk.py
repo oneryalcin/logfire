@@ -61,6 +61,8 @@ from logfire._internal.integrations.llm_providers.semconv import (
     CLAUDE_ENABLE_FILE_CHECKPOINTING,
     CLAUDE_FORK_ON_RESUME,
     CLAUDE_INCLUDE_PARTIAL_MESSAGES,
+    CLAUDE_IN_SUBAGENT_AGENT_ID,
+    CLAUDE_IN_SUBAGENT_AGENT_TYPE,
     CLAUDE_MAX_BUDGET_USD,
     CLAUDE_MAX_TURNS,
     CLAUDE_MCP_ENABLED,
@@ -812,7 +814,7 @@ def instrument_claude_agent_sdk(logfire_instance: Logfire) -> AbstractContextMan
                         if isinstance(msg, AssistantMessage):
                             state.handle_assistant_message(msg)
                         elif isinstance(msg, UserMessage):
-                            state.handle_user_message()
+                            state.handle_user_message(msg)
                         elif isinstance(msg, ResultMessage):
                             _record_result(root_span, msg)
                             if state.model:  # pragma: no branch
@@ -1133,6 +1135,16 @@ class _ConversationState:
         # treatment.
         self.subagent_spans: dict[str, LogfireSpan] = {}
         self.subagent_count = 0
+        # Issue #26: parent ``Task`` tool_use_id → subagent ``agent_id`` map,
+        # populated when ``TaskStartedMessage`` arrives (carries both fields).
+        # Used by ``open_chat_span`` to re-parent chat spans emitted during
+        # a subagent's turn under the matching ``subagent {agent_type}``
+        # span. Relies on the empirical equality
+        # ``TaskStartedMessage.task_id == SubagentStart.agent_id`` — verified
+        # under sequential and interleaved-parallel dispatches in the
+        # recon harness; degrades safely (chat span parents to root) if it
+        # ever breaks. Cleaned up at ``SubagentStop`` to bound size.
+        self.parent_tool_use_id_to_agent_id: dict[str, str] = {}
 
     def add_tool_result(self, tool_use_id: str, tool_name: str, result: Any) -> None:
         """Record a tool result to include in the next chat span's input messages."""
@@ -1142,8 +1154,17 @@ class _ConversationState:
         )
         self._history.append(msg)
 
-    def open_chat_span(self) -> None:
-        """Open a new chat span — call when the LLM starts processing."""
+    def open_chat_span(self, parent_tool_use_id: str | None = None) -> None:
+        """Open a new chat span — call when the LLM starts processing.
+
+        Issue #26: when ``parent_tool_use_id`` matches a known subagent via
+        ``parent_tool_use_id_to_agent_id``, parent the chat span under that
+        subagent's open envelope span instead of the root ``invoke_agent``.
+        Falls back to root parenting on any miss (unknown ``parent_tool_use_id``,
+        subagent already stopped, agent_id binding not yet populated) — the
+        chat span attaches under the active OTel context, which is the root
+        when no override is in play.
+        """
         self.close_chat_span()
 
         span_data: dict[str, Any] = {
@@ -1156,11 +1177,49 @@ class _ConversationState:
         if self._system_instructions:  # pragma: no branch
             span_data[SYSTEM_INSTRUCTIONS] = self._system_instructions
 
-        self._current_span = self.logfire.span('chat', **span_data)
-        # Start without entering context — chat spans don't need to be on the
-        # context stack, and this allows close_chat_span() to be called safely
-        # from hooks running in different async contexts.
-        self._current_span._start()  # pyright: ignore[reportPrivateUsage]
+        # Re-parent under the subagent OTel context if available; otherwise
+        # the chat span attaches under the active context (root invoke_agent).
+        # Span parent is fixed at creation, so we attach + create + detach
+        # immediately — chat spans never enter the context stack themselves.
+        token: Any = None
+        if parent_tool_use_id is not None:
+            agent_id = self.parent_tool_use_id_to_agent_id.get(parent_tool_use_id)
+            subagent_span = self.subagent_spans.get(agent_id) if agent_id is not None else None
+            if subagent_span is not None:
+                # Annotate the chat span with subagent attribution so it
+                # remains queryable even if visual nesting can't be
+                # resolved by a downstream renderer.
+                span_data[CLAUDE_IN_SUBAGENT_AGENT_ID] = agent_id
+                agent_type = (subagent_span.attributes or {}).get(CLAUDE_AGENT_TYPE)
+                if agent_type:
+                    span_data[CLAUDE_IN_SUBAGENT_AGENT_TYPE] = agent_type
+                otel_span = subagent_span._span  # pyright: ignore[reportPrivateUsage]
+                if otel_span is not None:
+                    token = context_api.attach(trace_api.set_span_in_context(otel_span))
+            else:
+                # Designed degradation: ptui present but binding lookup
+                # missed. Either the SDK delivered a chat message before its
+                # owning ``TaskStartedMessage`` (would invalidate the
+                # ordering invariant the recon harness verified), or
+                # ``task_id == agent_id`` no longer holds, or the subagent
+                # already stopped (stale ptui — see ``_record_subagent_stop``
+                # cleanup). Surface as debug so SDK drift becomes
+                # observable in instrumented sessions without spamming
+                # routine traces.
+                self.logfire.debug(
+                    'subagent chat-span re-parent skipped: ptui={parent_tool_use_id} not bound',
+                    parent_tool_use_id=parent_tool_use_id,
+                    agent_id_lookup_hit=agent_id is not None,
+                )
+        try:
+            self._current_span = self.logfire.span('chat', **span_data)
+            # Start without entering context — chat spans don't need to be on
+            # the context stack, and this allows close_chat_span() to be
+            # called safely from hooks running in different async contexts.
+            self._current_span._start()  # pyright: ignore[reportPrivateUsage]
+        finally:
+            if token is not None:
+                context_api.detach(token)
         self._current_output_parts = []
 
     def close_chat_span(self) -> None:
@@ -1176,9 +1235,19 @@ class _ConversationState:
             self._current_span = None
             self._current_output_parts = []
 
-    def handle_user_message(self) -> None:
-        """Handle UserMessage: open a new chat span for the next LLM call."""
-        self.open_chat_span()
+    def handle_user_message(self, message: UserMessage | None = None) -> None:
+        """Open a new chat span on UserMessage, re-parenting it under the
+        matching subagent envelope when the message originates inside one
+        (issue #26).
+
+        ``UserMessage.parent_tool_use_id`` is set when the SDK forwards a
+        subagent's turn through the parent stream. ``open_chat_span``
+        consults ``parent_tool_use_id_to_agent_id`` (populated by
+        ``_record_task_started``) to find the matching subagent span and
+        attach the new chat span under it.
+        """
+        # ``getattr(None, ...)`` returns the default safely, so no extra None guard.
+        self.open_chat_span(parent_tool_use_id=getattr(message, 'parent_tool_use_id', None))
 
     def handle_assistant_message(self, message: AssistantMessage) -> None:
         """Handle AssistantMessage: add output and usage to the current chat span."""
@@ -1277,6 +1346,12 @@ class _ConversationState:
         for span in self.active_tool_spans.values():
             span._end()  # pyright: ignore[reportPrivateUsage]
         self.active_tool_spans.clear()
+        # Issue #26: drop any ptui→agent_id entries that survived (session
+        # abort with subagents still mid-flight). Symmetric with the
+        # surrounding clear()s — the state object is dropped at
+        # ``_clear_state`` so this is mostly cosmetic, but matches the
+        # established drain pattern.
+        self.parent_tool_use_id_to_agent_id.clear()
 
 
 def _record_rate_limit_event(
@@ -1806,6 +1881,15 @@ def _record_subagent_stop(state: _ConversationState, input_data: Any) -> None:
         return
 
     span = state.subagent_spans.pop(agent_id, None)
+    # Issue #26: drop ptui→agent_id entries for this subagent so the map
+    # doesn't grow across long sessions. Late chat messages bearing this
+    # ptui (rare — would imply SDK out-of-order delivery) degrade safely:
+    # the lookup misses and the chat span parents under root.
+    state.parent_tool_use_id_to_agent_id = {
+        ptui: aid
+        for ptui, aid in state.parent_tool_use_id_to_agent_id.items()
+        if aid != agent_id
+    }
     last_assistant_message = input_data.get('last_assistant_message')
     transcript_path = input_data.get('agent_transcript_path')
 
@@ -1823,6 +1907,12 @@ def _record_task_started(state: _ConversationState, msg: Any) -> None:
     Carries the parent's ``tool_use_id`` (the Task tool call's id) so
     downstream queries can join Task lifecycle events to the parent's
     ``execute_tool`` span via ``gen_ai.tool.call.id``.
+
+    Issue #26: also populates ``parent_tool_use_id_to_agent_id`` so chat
+    spans emitted during the subagent's turn can be re-parented under the
+    matching ``subagent {agent_type}`` envelope. Relies on the empirical
+    ``task_id == agent_id`` equality (verified in recon for sequential and
+    interleaved-parallel dispatches).
     """
     attrs = _msg_attrs(msg, (
         ('task_id', CLAUDE_TASK_ID),
@@ -1830,6 +1920,10 @@ def _record_task_started(state: _ConversationState, msg: Any) -> None:
         ('task_type', CLAUDE_TASK_TYPE),
         ('tool_use_id', TOOL_CALL_ID),
     ))
+    tool_use_id = getattr(msg, 'tool_use_id', None)
+    task_id = getattr(msg, 'task_id', None)
+    if tool_use_id and task_id:
+        state.parent_tool_use_id_to_agent_id[tool_use_id] = task_id
     state.logfire.info('Task started', **attrs)
 
 

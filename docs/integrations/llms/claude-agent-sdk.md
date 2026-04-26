@@ -132,7 +132,7 @@ These spans are top-level (no `invoke_agent` parent) when called between turns; 
 
 ## Subagent observability
 
-When the Claude CLI spawns a subagent via the Task tool, the integration opens a `subagent {agent_type}` child span under `invoke_agent` keyed by `agent_id` (`SubagentStart` hook). The span closes on the matching `SubagentStop`, and tool calls fired inside the subagent context re-parent their `execute_tool` child spans under the subagent span rather than the root `invoke_agent`. The trace tree looks like:
+When the Claude CLI spawns a subagent via the Task tool, the integration opens a `subagent {agent_type}` child span under `invoke_agent` keyed by `agent_id` (`SubagentStart` hook). The span closes on the matching `SubagentStop`. Tool calls fired inside the subagent context re-parent their `execute_tool` child spans under the subagent span via `agent_id`, and per-turn `chat` spans emitted while the subagent is running re-parent under the subagent span via the `parent_tool_use_id` carried on subagent-originating `UserMessage` / `AssistantMessage` (issue #26). The trace tree looks like:
 
 ```
 invoke_agent                      (root, parent thread)
@@ -140,7 +140,9 @@ invoke_agent                      (root, parent thread)
 ├── execute_tool Agent            (parent's view of the Task tool — current SDK
 │                                  surfaces the Task tool as 'Agent')
 ├── subagent echo-helper          (sibling of execute_tool Agent)
-│   └── execute_tool Bash         (subagent's tool call, re-parented via agent_id)
+│   ├── chat claude-haiku-…       (subagent's per-turn chat span, nested via #26)
+│   ├── execute_tool Bash         (subagent's tool call, re-parented via agent_id)
+│   └── chat claude-haiku-…       (subagent's continuation after the tool result)
 ├── Task started                  (log under invoke_agent, info)
 ├── Task progress                 (log; only fires for tool-using or background subagents)
 ├── Task completed                (log; level depends on status)
@@ -164,11 +166,9 @@ Three system-message events emitted during the subagent run surface as logs unde
 
 ### Parallel subagents
 
-Multiple Task dispatches in a single parent turn produce multiple concurrent `subagent` spans, each keyed by its own `agent_id`. The integration's per-conversation `subagent_spans` dict disambiguates by `agent_id`, so each subagent's tool calls correctly nest under its own span even when their hook callbacks interleave over the SDK's control channel.
+Multiple Task dispatches in a single parent turn produce multiple concurrent `subagent` spans, each keyed by its own `agent_id`. The integration's per-conversation `subagent_spans` dict disambiguates by `agent_id`, so each subagent's tool calls correctly nest under its own span even when their hook callbacks interleave over the SDK's control channel. Chat spans emitted by parallel subagents disambiguate the same way: each subagent-originating `UserMessage` carries a unique `parent_tool_use_id` that resolves through the `parent_tool_use_id_to_agent_id` map (populated by `TaskStartedMessage`) to the right subagent span.
 
-### Known limitation: subagent chat spans flatten under invoke_agent
-
-Subagent assistant turns produce `chat` spans flat under `invoke_agent` rather than nested under their parent `subagent` span. The dispatch loop's `handle_assistant_message` / `handle_user_message` don't have `agent_id` available — only `parent_tool_use_id`. Cross-correlation is still possible via the `claude.parent_tool_use_id` attribute already captured on each chat span, joined to the parent's `execute_tool Agent` span via `gen_ai.tool.call.id`. Fully nesting subagent chat spans under the subagent span requires building a `parent_tool_use_id → agent_id` map and refactoring `_ConversationState`'s span lifecycle; tracked separately to land with dedicated design + review attention.
+Re-parented chat spans also carry `claude.in_subagent.agent_id` and `claude.in_subagent.agent_type` for queryability — useful in renderers that flatten the trace tree, and for SQL filters like `WHERE attributes->>'claude.in_subagent.agent_type' = 'reviewer'`.
 
 ## End-of-conversation result fields
 
