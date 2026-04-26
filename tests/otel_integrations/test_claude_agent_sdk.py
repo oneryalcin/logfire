@@ -40,6 +40,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from claude_agent_sdk._errors import CLINotFoundError, ProcessError
 from claude_agent_sdk.types import HookContext
@@ -2396,6 +2397,220 @@ async def test_three_parallel_subagents_each_tool_lands_under_correct_span(expor
     assert parent_by_tool_id['tu_A1'] == by_agent_id['A_id']['context']['span_id']
     assert parent_by_tool_id['tu_B1'] == by_agent_id['B_id']['context']['span_id']
     assert parent_by_tool_id['tu_C1'] == by_agent_id['C_id']['context']['span_id']
+
+
+# ---------------------------------------------------------------------------
+# Issue #26: chat-span re-parenting under subagent envelope.
+#
+# These tests use the SimpleNamespace-style direct-call pattern (matching
+# the surrounding #3 tests) rather than a cassette: the binding logic is
+# pure span-construction and the cassette would only re-prove what the
+# unit tests already lock.
+# ---------------------------------------------------------------------------
+
+
+def _task_started_msg(task_id: str, tool_use_id: str) -> Any:
+    """Build a TaskStartedMessage-shaped object for ``_record_task_started``.
+
+    ``_record_task_started`` and its helpers use ``getattr(msg, ..., None)``,
+    so only the fields the binding logic actually reads need to be set.
+    """
+    return SimpleNamespace(task_id=task_id, tool_use_id=tool_use_id)
+
+
+@pytest.mark.anyio
+async def test_subagent_chat_spans_nest_under_subagent_envelope(exporter: TestExporter) -> None:
+    """**The #26 lock.** A chat span opened via ``handle_user_message`` with
+    a ``UserMessage.parent_tool_use_id`` matching a known subagent parents
+    under that subagent's span — not the root ``invoke_agent`` — and carries
+    the ``claude.in_subagent.*`` annotation attributes for queryability.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            # SubagentStart populates state.subagent_spans[agent_id].
+            _record_subagent_start(state, {'agent_id': 'agent_X', 'agent_type': 'echo-helper'})
+            # TaskStartedMessage populates the parent_tool_use_id → agent_id map.
+            _record_task_started(state, _task_started_msg(task_id='agent_X', tool_use_id='tu_parent_1'))
+
+            # Subagent's UserMessage arrives with parent_tool_use_id set.
+            msg = UserMessage(content='echo this', parent_tool_use_id='tu_parent_1')
+            state.handle_user_message(msg)
+
+            # Close out so spans are exported.
+            state.close_chat_span()
+            _record_subagent_stop(state, {'agent_id': 'agent_X', 'agent_type': 'echo-helper'})
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    sub_span = next(s for s in spans if s['name'] == 'subagent {agent_type}')
+    chat_span = next(s for s in spans if s['name'] == 'chat')
+    assert chat_span['parent']['span_id'] == sub_span['context']['span_id']
+    assert chat_span['attributes']['claude.in_subagent.agent_id'] == 'agent_X'
+    assert chat_span['attributes']['claude.in_subagent.agent_type'] == 'echo-helper'
+
+
+@pytest.mark.anyio
+async def test_three_parallel_subagents_chat_spans_attribute_correctly(exporter: TestExporter) -> None:
+    """Parallel-subagent disambiguation for chat spans. Three subagents
+    with overlapping lifetimes; each subagent emits its own chat turns
+    interleaved with the others'. Every chat span must land under its
+    own subagent — not a sibling subagent's, not the root.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            # Three subagents start; bindings populated in arbitrary order.
+            _record_subagent_start(state, {'agent_id': 'A_id', 'agent_type': 'reviewer'})
+            _record_subagent_start(state, {'agent_id': 'B_id', 'agent_type': 'planner'})
+            _record_subagent_start(state, {'agent_id': 'C_id', 'agent_type': 'reviewer'})  # same type as A
+            _record_task_started(state, _task_started_msg(task_id='A_id', tool_use_id='tu_A'))
+            _record_task_started(state, _task_started_msg(task_id='B_id', tool_use_id='tu_B'))
+            _record_task_started(state, _task_started_msg(task_id='C_id', tool_use_id='tu_C'))
+
+            # Interleaved chat opens — each handle_user_message closes the
+            # previous chat span (single _current_span) so every open
+            # produces a fresh chat span we can inspect.
+            state.handle_user_message(UserMessage(content='c1', parent_tool_use_id='tu_A'))
+            state.handle_user_message(UserMessage(content='c2', parent_tool_use_id='tu_C'))
+            state.handle_user_message(UserMessage(content='c3', parent_tool_use_id='tu_B'))
+            state.handle_user_message(UserMessage(content='c4', parent_tool_use_id='tu_A'))
+            state.handle_user_message(UserMessage(content='c5', parent_tool_use_id='tu_C'))
+            state.close_chat_span()
+
+            _record_subagent_stop(state, {'agent_id': 'B_id', 'agent_type': 'planner'})
+            _record_subagent_stop(state, {'agent_id': 'A_id', 'agent_type': 'reviewer'})
+            _record_subagent_stop(state, {'agent_id': 'C_id', 'agent_type': 'reviewer'})
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    sub_spans = [s for s in spans if s['name'] == 'subagent {agent_type}']
+    assert len(sub_spans) == 3
+    by_agent_id = {s['attributes']['claude.agent_id']: s for s in sub_spans}
+
+    chat_spans = [s for s in spans if s['name'] == 'chat']
+    assert len(chat_spans) == 5
+    # Each chat span's parent must be the subagent matching its
+    # claude.in_subagent.agent_id annotation — not a sibling, not the root.
+    for c in chat_spans:
+        annotated_agent_id = c['attributes']['claude.in_subagent.agent_id']
+        assert c['parent']['span_id'] == by_agent_id[annotated_agent_id]['context']['span_id'], (
+            f'chat span annotated with agent_id={annotated_agent_id} parented under '
+            f"span_id={c['parent']['span_id']}, expected {by_agent_id[annotated_agent_id]['context']['span_id']}"
+        )
+
+
+@pytest.mark.anyio
+async def test_chat_spans_with_no_active_subagent_attach_to_invoke_agent(exporter: TestExporter) -> None:
+    """Regression guard: a UserMessage with no ``parent_tool_use_id`` (the
+    common, non-subagent path) keeps parenting chat spans under the root
+    ``invoke_agent`` — the #26 patch must not redirect non-subagent traffic.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            state.handle_user_message(UserMessage(content='hi'))
+            state.close_chat_span()
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    chat_span = next(s for s in spans if s['name'] == 'chat')
+    root_span = next(s for s in spans if s['name'] == 'invoke_agent')
+    assert chat_span['parent']['span_id'] == root_span['context']['span_id']
+    assert 'claude.in_subagent.agent_id' not in chat_span['attributes']
+
+
+@pytest.mark.anyio
+async def test_chat_span_with_unknown_parent_tool_use_id_falls_back_to_root(exporter: TestExporter) -> None:
+    """Defensive degradation: if a UserMessage carries a ``parent_tool_use_id``
+    that has no entry in ``parent_tool_use_id_to_agent_id`` (TaskStartedMessage
+    didn't arrive yet, or the SDK skipped it), the chat span attaches under
+    the root ``invoke_agent`` instead of crashing. No annotation attrs are
+    stamped since attribution is unknown.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            state.handle_user_message(UserMessage(content='hi', parent_tool_use_id='tu_unknown'))
+            state.close_chat_span()
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    chat_span = next(s for s in spans if s['name'] == 'chat')
+    root_span = next(s for s in spans if s['name'] == 'invoke_agent')
+    assert chat_span['parent']['span_id'] == root_span['context']['span_id']
+    assert 'claude.in_subagent.agent_id' not in chat_span['attributes']
+
+
+@pytest.mark.anyio
+async def test_chat_span_with_stale_parent_tool_use_id_after_stop_falls_back_to_root(exporter: TestExporter) -> None:
+    """Distinct from the *unknown-ptui* path: this exercises the
+    *cleanup-then-degrade* contract where a binding existed, was dropped
+    at ``_record_subagent_stop``, and a late chat message arrives bearing
+    the now-stale ``parent_tool_use_id``. Designed degradation per the
+    integration's docstring: chat span attaches under root, no annotation.
+    Locks the cleanup side-effect that the patch comments call out as
+    load-bearing.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _set_state(state)
+        try:
+            _record_subagent_start(state, {'agent_id': 'agent_X', 'agent_type': 'echo-helper'})
+            _record_task_started(state, _task_started_msg(task_id='agent_X', tool_use_id='tu_stale'))
+            _record_subagent_stop(state, {'agent_id': 'agent_X', 'agent_type': 'echo-helper'})
+            # Subagent already stopped — late chat message arrives with
+            # the now-stale ptui (rare; would imply SDK out-of-order
+            # delivery).
+            state.handle_user_message(UserMessage(content='late', parent_tool_use_id='tu_stale'))
+            state.close_chat_span()
+        finally:
+            _clear_state()
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    chat_span = next(s for s in spans if s['name'] == 'chat')
+    root_span = next(s for s in spans if s['name'] == 'invoke_agent')
+    assert chat_span['parent']['span_id'] == root_span['context']['span_id']
+    assert 'claude.in_subagent.agent_id' not in chat_span['attributes']
+
+
+def test_subagent_stop_clears_parent_tool_use_id_to_agent_id_entries() -> None:
+    """``_record_subagent_stop`` drops every ``ptui → agent_id`` entry for
+    the closing subagent so the map doesn't grow unboundedly across long
+    sessions. Entries for OTHER live subagents must be preserved.
+    """
+    logfire_instance = logfire.DEFAULT_LOGFIRE_INSTANCE.with_settings(custom_scope_suffix='claude_agent_sdk')
+    with logfire_instance.span('invoke_agent') as root:
+        state = _ConversationState(logfire=logfire_instance, root_span=root, input_messages=[])
+        _record_subagent_start(state, {'agent_id': 'A_id', 'agent_type': 'reviewer'})
+        _record_subagent_start(state, {'agent_id': 'B_id', 'agent_type': 'reviewer'})
+        _record_task_started(state, _task_started_msg(task_id='A_id', tool_use_id='tu_A1'))
+        _record_task_started(state, _task_started_msg(task_id='A_id', tool_use_id='tu_A2'))
+        _record_task_started(state, _task_started_msg(task_id='B_id', tool_use_id='tu_B1'))
+
+        assert state.parent_tool_use_id_to_agent_id == {
+            'tu_A1': 'A_id', 'tu_A2': 'A_id', 'tu_B1': 'B_id',
+        }
+
+        _record_subagent_stop(state, {'agent_id': 'A_id', 'agent_type': 'reviewer'})
+        # Both A entries dropped; B preserved.
+        assert state.parent_tool_use_id_to_agent_id == {'tu_B1': 'B_id'}
+
+        _record_subagent_stop(state, {'agent_id': 'B_id', 'agent_type': 'reviewer'})
+        assert state.parent_tool_use_id_to_agent_id == {}
 
 
 @pytest.mark.anyio

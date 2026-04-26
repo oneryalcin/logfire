@@ -297,6 +297,14 @@ CLAUDE_SUBAGENT_LAST_ASSISTANT_MESSAGE = 'claude.subagent.last_assistant_message
 # Cumulative subagent count emitted on the root invoke_agent at close.
 CLAUDE_SUBAGENT_COUNT = 'claude.subagent_count'
 
+# Issue #26: stamped on per-turn ``chat`` spans whose ``UserMessage.parent_tool_use_id``
+# resolves to a known subagent. The chat span is also re-parented under the
+# matching ``subagent {agent_type}`` envelope; these attrs make the
+# attribution queryable independent of trace-tree rendering and are kept
+# verbatim across renderers that flatten the hierarchy.
+CLAUDE_IN_SUBAGENT_AGENT_ID = 'claude.in_subagent.agent_id'
+CLAUDE_IN_SUBAGENT_AGENT_TYPE = 'claude.in_subagent.agent_type'
+
 # ``AgentDefinition`` metadata captured on the subagent span at
 # ``SubagentStart`` time (issue #3, Option B). Mirrors the
 # ``_options_attrs`` pattern from #8 — looked up via
